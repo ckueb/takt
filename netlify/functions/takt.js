@@ -4,14 +4,12 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 /**
- * Netlify Function: /.netlify/functions/takt
+ * Netlify Function (klassisch): /.netlify/functions/takt
  * Request body: { "text": "..." }
  *
- * Knowledge file options:
- * 1) Set env var TAKT_KB_PATH to an absolute/relative path, e.g. "netlify/functions/takt_knowledge.json"
- * 2) Default search:
- *    - same folder as this function file
- *    - repo-root + "netlify/functions/takt_knowledge.json"
+ * WICHTIG:
+ * - Netlify injiziert in manchen Runtimes bereits __filename / __dirname.
+ *   Darum verwenden wir bewusst NICHT diese Identifier, sondern eigene Namen.
  */
 
 const DEFAULT_MAX_CHARS = 2000;
@@ -19,14 +17,15 @@ const MAX_CHARS = Number(process.env.TAKT_MAX_CHARS || DEFAULT_MAX_CHARS);
 
 let KB = null;
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+// Eigene Namen statt __filename / __dirname (fix für: "Identifier '__filename' has already been declared")
+const thisFile = fileURLToPath(import.meta.url);
+const thisDir = path.dirname(thisFile);
 
 function resolveKbPath() {
   if (process.env.TAKT_KB_PATH) return process.env.TAKT_KB_PATH;
 
   const candidates = [
-    path.join(__dirname, "takt_knowledge.json"),
+    path.join(thisDir, "takt_knowledge.json"),
     path.join(process.cwd(), "netlify", "functions", "takt_knowledge.json"),
     path.join(process.cwd(), "netlify/functions/takt_knowledge.json"),
   ];
@@ -37,7 +36,6 @@ function resolveKbPath() {
     } catch {}
   }
 
-  // Fallback (will fail loudly with a helpful error)
   return candidates[0];
 }
 
@@ -145,7 +143,11 @@ function buildStyleSystem() {
 export const handler = async (event) => {
   try {
     if ((event.httpMethod || "").toUpperCase() === "OPTIONS") {
-      return json(204, {}, { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Headers": "Content-Type" });
+      return json(204, {}, {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Headers": "Content-Type",
+        "Access-Control-Allow-Methods": "POST, OPTIONS"
+      });
     }
 
     if ((event.httpMethod || "").toUpperCase() !== "POST") {
@@ -160,7 +162,6 @@ export const handler = async (event) => {
     }
 
     const text = String(body.text || "").trim();
-
     if (!text) return json(400, { error: "Bitte einen Kommentar im Feld „Kommentar“ einfügen." });
     if (text.length > MAX_CHARS) return json(400, { error: `Text zu lang. Maximal ${MAX_CHARS} Zeichen.` });
 
@@ -168,13 +169,11 @@ export const handler = async (event) => {
       return json(400, { error: "Bitte keine Schlüssel oder Zugangsdaten einfügen." });
     }
 
-    // If the KB is missing, fail with a clear error instead of a 502.
-    // This helps you diagnose packaging issues.
     if (!fs.existsSync(KB_PATH)) {
       return json(500, {
         error: "Knowledge-Datei nicht gefunden.",
-        hint: "Lege netlify/functions/takt_knowledge.json ins Repo und setze in netlify.toml [functions].included_files entsprechend. Optional: Setze TAKT_KB_PATH.",
-        kb_path_tried: KB_PATH
+        kb_path_tried: KB_PATH,
+        hint: "Lege netlify/functions/takt_knowledge.json ins Repo und setze in netlify.toml: [functions].included_files = [\"netlify/functions/takt_knowledge.json\"]. Optional: TAKT_KB_PATH setzen."
       });
     }
 
