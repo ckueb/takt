@@ -1,63 +1,23 @@
-import OpenAI from "openai";
-import fs from "node:fs";
-import path from "node:path";
-
 /**
- * Netlify Function (klassisch): /.netlify/functions/takt
+ * Netlify Function (CommonJS): /.netlify/functions/takt
  * Request body: { "text": "..." }
  *
- * WICHTIG:
- * - Netlify injiziert in manchen Runtimes bereits __filename / __dirname.
- *   Darum verwenden wir bewusst NICHT diese Identifier, sondern eigene Namen.
+ * Fixes the "module is not defined in ES module scope" issue by:
+ * - using CommonJS exports (exports.handler)
+ * - requiring Node built-ins normally
+ * - NOT relying on "type":"module" in package.json
+ *
+ * Works with OpenAI SDKs that are ESM-only via dynamic import.
  */
+
+const fs = require("fs");
+const path = require("path");
 
 const DEFAULT_MAX_CHARS = 2000;
 const MAX_CHARS = Number(process.env.TAKT_MAX_CHARS || DEFAULT_MAX_CHARS);
 
 let KB = null;
-
-// Robust in Netlify: funktioniert in CommonJS-Bundle und fällt notfalls auf cwd zurück
-const baseDir = typeof __dirname !== "undefined" ? __dirname : process.cwd();
-
-function resolveKbPath() {
-  if (process.env.TAKT_KB_PATH) return process.env.TAKT_KB_PATH;
-
-  const candidates = [
-    path.join(baseDir, "takt_knowledge.json"),
-    path.join(process.cwd(), "netlify", "functions", "takt_knowledge.json"),
-    path.join(process.cwd(), "netlify/functions/takt_knowledge.json"),
-  ];
-
-  for (const p of candidates) {
-    try {
-      if (fs.existsSync(p)) return p;
-    } catch {}
-  }
-  return candidates[0];
-}
-
-const KB_PATH = resolveKbPath();
-const thisDir = path.dirname(thisFile);
-
-function resolveKbPath() {
-  if (process.env.TAKT_KB_PATH) return process.env.TAKT_KB_PATH;
-
-  const candidates = [
-    path.join(thisDir, "takt_knowledge.json"),
-    path.join(process.cwd(), "netlify", "functions", "takt_knowledge.json"),
-    path.join(process.cwd(), "netlify/functions/takt_knowledge.json"),
-  ];
-
-  for (const p of candidates) {
-    try {
-      if (fs.existsSync(p)) return p;
-    } catch {}
-  }
-
-  return candidates[0];
-}
-
-const KB_PATH = resolveKbPath();
+let OpenAIClient = null;
 
 function json(statusCode, bodyObj, extraHeaders = {}) {
   return {
@@ -71,6 +31,26 @@ function json(statusCode, bodyObj, extraHeaders = {}) {
   };
 }
 
+function resolveKbPath() {
+  if (process.env.TAKT_KB_PATH) return process.env.TAKT_KB_PATH;
+
+  // In Netlify Functions, __dirname points to the deployed function folder.
+  const candidates = [
+    path.join(__dirname, "takt_knowledge.json"),
+    path.join(process.cwd(), "netlify", "functions", "takt_knowledge.json"),
+    path.join(process.cwd(), "netlify/functions/takt_knowledge.json"),
+  ];
+
+  for (const p of candidates) {
+    try {
+      if (fs.existsSync(p)) return p;
+    } catch {}
+  }
+  return candidates[0];
+}
+
+const KB_PATH = resolveKbPath();
+
 function loadKb() {
   if (KB) return KB;
   const raw = fs.readFileSync(KB_PATH, "utf8");
@@ -82,7 +62,7 @@ function loadKb() {
 const tokenRe = /[A-Za-zÄÖÜäöüß0-9]+/g;
 
 function tokenize(s) {
-  return (s.match(tokenRe) || [])
+  return (String(s).match(tokenRe) || [])
     .map((w) => w.toLowerCase())
     .filter((w) => w.length >= 3);
 }
@@ -158,7 +138,17 @@ function buildStyleSystem() {
 `.trim();
 }
 
-export const handler = async (event) => {
+async function getOpenAI() {
+  if (OpenAIClient) return OpenAIClient;
+
+  // Works even if the SDK is ESM-only:
+  const mod = await import("openai");
+  const OpenAI = mod.default || mod.OpenAI || mod;
+  OpenAIClient = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+  return OpenAIClient;
+}
+
+exports.handler = async (event) => {
   try {
     if ((event.httpMethod || "").toUpperCase() === "OPTIONS") {
       return json(204, {}, {
@@ -187,11 +177,15 @@ export const handler = async (event) => {
       return json(400, { error: "Bitte keine Schlüssel oder Zugangsdaten einfügen." });
     }
 
+    if (!process.env.OPENAI_API_KEY) {
+      return json(500, { error: "OPENAI_API_KEY fehlt in Netlify Environment Variables." });
+    }
+
     if (!fs.existsSync(KB_PATH)) {
       return json(500, {
         error: "Knowledge-Datei nicht gefunden.",
         kb_path_tried: KB_PATH,
-        hint: "Lege netlify/functions/takt_knowledge.json ins Repo und setze in netlify.toml: [functions].included_files = [\"netlify/functions/takt_knowledge.json\"]. Optional: TAKT_KB_PATH setzen."
+        hint: "Lege netlify/functions/takt_knowledge.json ins Repo. In netlify.toml: [functions].included_files = [\"netlify/functions/takt_knowledge.json\"]. Optional: TAKT_KB_PATH setzen."
       });
     }
 
@@ -200,7 +194,7 @@ export const handler = async (event) => {
       .map((s) => `Quelle: ${s.source} | Abschnitt: ${s.title}\n${s.text}`)
       .join("\n\n");
 
-    const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+    const client = await getOpenAI();
 
     const r = await client.responses.create({
       model: "gpt-4.1-mini",
@@ -215,7 +209,7 @@ export const handler = async (event) => {
 
     return json(200, { output: (r.output_text || "").trim() });
   } catch (e) {
-    console.error("TAKT function error:", e?.message || e);
+    console.error("TAKT function error:", e);
     return json(500, { error: "Serverfehler. Bitte später erneut versuchen." });
   }
 };
