@@ -1,5 +1,10 @@
 [build]
   publish = "."
   functions = "netlify/functions"
+  
+[functions]
+  included_files = ["netlify/functions/takt_knowledge.json"]
+
 [build.environment]
   NODE_VERSION = "18"
+
