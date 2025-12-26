@@ -5,13 +5,13 @@ import { fileURLToPath } from "node:url";
 
 /**
  * Netlify Function: /.netlify/functions/takt
+ * Request body: { "text": "..." }
  *
- * Erwarteter Request Body:
- * { "text": "..." }
- *
- * Knowledge:
- * - Lege takt_knowledge.json in denselben Ordner wie diese Function-Datei (netlify/functions/).
- * - Optional: TAKT_KB_PATH als Environment Variable setzen.
+ * Knowledge file options:
+ * 1) Set env var TAKT_KB_PATH to an absolute/relative path, e.g. "netlify/functions/takt_knowledge.json"
+ * 2) Default search:
+ *    - same folder as this function file
+ *    - repo-root + "netlify/functions/takt_knowledge.json"
  */
 
 const DEFAULT_MAX_CHARS = 2000;
@@ -21,7 +21,39 @@ let KB = null;
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const KB_PATH = process.env.TAKT_KB_PATH || path.join(__dirname, "takt_knowledge.json");
+
+function resolveKbPath() {
+  if (process.env.TAKT_KB_PATH) return process.env.TAKT_KB_PATH;
+
+  const candidates = [
+    path.join(__dirname, "takt_knowledge.json"),
+    path.join(process.cwd(), "netlify", "functions", "takt_knowledge.json"),
+    path.join(process.cwd(), "netlify/functions/takt_knowledge.json"),
+  ];
+
+  for (const p of candidates) {
+    try {
+      if (fs.existsSync(p)) return p;
+    } catch {}
+  }
+
+  // Fallback (will fail loudly with a helpful error)
+  return candidates[0];
+}
+
+const KB_PATH = resolveKbPath();
+
+function json(statusCode, bodyObj, extraHeaders = {}) {
+  return {
+    statusCode,
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
+      "Cache-Control": "no-store",
+      ...extraHeaders
+    },
+    body: JSON.stringify(bodyObj)
+  };
+}
 
 function loadKb() {
   if (KB) return KB;
@@ -30,6 +62,7 @@ function loadKb() {
   return KB;
 }
 
+// RAG-light retrieval
 const tokenRe = /[A-Za-zÄÖÜäöüß0-9]+/g;
 
 function tokenize(s) {
@@ -39,7 +72,6 @@ function tokenize(s) {
 }
 
 function idf(df, N) {
-  // Smooth IDF
   return Math.log((N + 1) / (df + 1)) + 1;
 }
 
@@ -48,7 +80,6 @@ function retrieveSnippets(queryText, topK = 6) {
   const qTokens = tokenize(queryText);
   if (qTokens.length === 0) return [];
 
-  // Query TF
   const qtf = new Map();
   for (const t of qTokens) qtf.set(t, (qtf.get(t) || 0) + 1);
 
@@ -58,7 +89,6 @@ function retrieveSnippets(queryText, topK = 6) {
     const tf = ch.tf || {};
     let score = 0;
 
-    // Light TF-IDF dot product
     for (const [t, qCount] of qtf.entries()) {
       const dCount = tf[t] || 0;
       if (!dCount) continue;
@@ -112,33 +142,40 @@ function buildStyleSystem() {
 `.trim();
 }
 
-function json(status, body) {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" }
-  });
-}
-
-export default async function handler(req) {
+export const handler = async (event) => {
   try {
-    if (req.method !== "POST") {
-      return json(405, { error: "Use POST with JSON { text }" });
+    if ((event.httpMethod || "").toUpperCase() === "OPTIONS") {
+      return json(204, {}, { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Headers": "Content-Type" });
     }
 
-    const body = await req.json().catch(() => ({}));
+    if ((event.httpMethod || "").toUpperCase() !== "POST") {
+      return json(405, { error: "Nur POST erlaubt." });
+    }
+
+    let body = {};
+    try {
+      body = JSON.parse(event.body || "{}");
+    } catch {
+      body = {};
+    }
+
     const text = String(body.text || "").trim();
 
-    if (!text) {
-      return json(400, { error: "Missing 'text'." });
-    }
+    if (!text) return json(400, { error: "Bitte einen Kommentar im Feld „Kommentar“ einfügen." });
+    if (text.length > MAX_CHARS) return json(400, { error: `Text zu lang. Maximal ${MAX_CHARS} Zeichen.` });
 
-    if (text.length > MAX_CHARS) {
-      return json(400, { error: `Text too long (max ${MAX_CHARS} chars).` });
-    }
-
-    // Tiny abuse guardrail
     if (text.includes("sk-")) {
       return json(400, { error: "Bitte keine Schlüssel oder Zugangsdaten einfügen." });
+    }
+
+    // If the KB is missing, fail with a clear error instead of a 502.
+    // This helps you diagnose packaging issues.
+    if (!fs.existsSync(KB_PATH)) {
+      return json(500, {
+        error: "Knowledge-Datei nicht gefunden.",
+        hint: "Lege netlify/functions/takt_knowledge.json ins Repo und setze in netlify.toml [functions].included_files entsprechend. Optional: Setze TAKT_KB_PATH.",
+        kb_path_tried: KB_PATH
+      });
     }
 
     const snippets = retrieveSnippets(text, 6);
@@ -161,6 +198,7 @@ export default async function handler(req) {
 
     return json(200, { output: (r.output_text || "").trim() });
   } catch (e) {
-    return json(500, { error: "Server error" });
+    console.error("TAKT function error:", e?.message || e);
+    return json(500, { error: "Serverfehler. Bitte später erneut versuchen." });
   }
-}
+};
