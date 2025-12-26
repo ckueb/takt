@@ -1,7 +1,6 @@
 import OpenAI from "openai";
 import fs from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 
 /**
  * Netlify Function (klassisch): /.netlify/functions/takt
@@ -17,8 +16,27 @@ const MAX_CHARS = Number(process.env.TAKT_MAX_CHARS || DEFAULT_MAX_CHARS);
 
 let KB = null;
 
-// Eigene Namen statt __filename / __dirname (fix für: "Identifier '__filename' has already been declared")
-const thisFile = fileURLToPath(import.meta.url);
+// Robust in Netlify: funktioniert in CommonJS-Bundle und fällt notfalls auf cwd zurück
+const baseDir = typeof __dirname !== "undefined" ? __dirname : process.cwd();
+
+function resolveKbPath() {
+  if (process.env.TAKT_KB_PATH) return process.env.TAKT_KB_PATH;
+
+  const candidates = [
+    path.join(baseDir, "takt_knowledge.json"),
+    path.join(process.cwd(), "netlify", "functions", "takt_knowledge.json"),
+    path.join(process.cwd(), "netlify/functions/takt_knowledge.json"),
+  ];
+
+  for (const p of candidates) {
+    try {
+      if (fs.existsSync(p)) return p;
+    } catch {}
+  }
+  return candidates[0];
+}
+
+const KB_PATH = resolveKbPath();
 const thisDir = path.dirname(thisFile);
 
 function resolveKbPath() {
