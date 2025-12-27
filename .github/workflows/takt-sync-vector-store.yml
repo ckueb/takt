@@ -23,6 +23,12 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Install Python deps (python-docx)
+        run: |
+          set -euxo pipefail
+          python -m pip install --upgrade pip
+          pip install python-docx
+
       - name: Install dependencies
         run: |
           set -euxo pipefail
