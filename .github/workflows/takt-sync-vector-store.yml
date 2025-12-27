@@ -9,47 +9,78 @@ on:
 jobs:
   sync_and_deploy:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "20"
 
       - name: Install pandoc
         run: |
+          set -euxo pipefail
           sudo apt-get update
           sudo apt-get install -y pandoc
 
-      - name: Convert DOCX -> Markdown
+      - name: Convert DOCX -> Markdown (robust)
         run: |
+          set -euxo pipefail
+
           mkdir -p docs/converted
+
+          # These two are strict (must exist with exact names)
           pandoc "docs/source/regelwerk.docx" -t gfm -o "docs/converted/regelwerk.md"
           pandoc "docs/source/brandvoice.docx" -t gfm -o "docs/converted/brandvoice.md"
-          pandoc "docs/source/CM-Eskalations-Konfliktanalyst.docx" -t gfm -o "docs/converted/cm.md"
+
+          # This one is flexible (any matching filename)
+          CM_FILE="$(ls -1 docs/source/CM-Eskalations-Konfliktanalyst*.docx 2>/dev/null | head -n 1 || true)"
+          if [ -z "$CM_FILE" ]; then
+            echo "ERROR: Could not find docs/source/CM-Eskalations-Konfliktanalyst*.docx"
+            echo "Files in docs/source/:"
+            ls -la docs/source
+            exit 1
+          fi
+
+          echo "Using CM file: $CM_FILE"
+          pandoc "$CM_FILE" -t gfm -o "docs/converted/cm.md"
+
           echo "Converted files:"
           ls -la docs/converted
 
-      - name: Upload + create vector store (OpenAI)
+      - name: Create Vector Store + upload files (OpenAI)
         id: ingest
         run: |
+          set -euxo pipefail
+
+          # The script must print a line like: VECTOR_STORE_ID=vs_...
           node tools/openai_vectorstore_sync.mjs > ingest.out
+
+          echo "----- openai_vectorstore_sync output -----"
           cat ingest.out
-          VS_ID=$(grep "^VECTOR_STORE_ID=" ingest.out | cut -d= -f2 | tr -d '\r')
+          echo "------------------------------------------"
+
+          VS_ID="$(grep '^VECTOR_STORE_ID=' ingest.out | head -n 1 | cut -d= -f2 | tr -d '\r' || true)"
           if [ -z "$VS_ID" ]; then
-            echo "ERROR: VECTOR_STORE_ID not found in output"
+            echo "ERROR: VECTOR_STORE_ID not found in script output."
             exit 1
           fi
+
           echo "vector_store_id=$VS_ID" >> "$GITHUB_OUTPUT"
+          echo "Vector Store created: $VS_ID"
+
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
 
       - name: Set Netlify env var (TAKT_VECTOR_STORE_ID)
         run: |
+          set -euxo pipefail
+
           npm i -g netlify-cli
           echo "Setting TAKT_VECTOR_STORE_ID=${{ steps.ingest.outputs.vector_store_id }}"
+
           netlify env:set TAKT_VECTOR_STORE_ID "${{ steps.ingest.outputs.vector_store_id }}" --site "$NETLIFY_SITE_ID"
         env:
           NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
@@ -57,6 +88,8 @@ jobs:
 
       - name: Trigger Netlify deploy (Build Hook)
         run: |
+          set -euxo pipefail
+
           echo "Deploying with TAKT_VECTOR_STORE_ID=${{ steps.ingest.outputs.vector_store_id }}"
           curl -s -X POST "$NETLIFY_BUILD_HOOK_URL"
         env:
