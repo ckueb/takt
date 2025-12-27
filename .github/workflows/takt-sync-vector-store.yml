@@ -58,6 +58,15 @@ jobs:
           test -f "docs/source/regelwerk.docx"
           test -f "docs/source/brandvoice.docx"
 
+          # DEBUG: Prüfe direkt im DOCX-XML, ob Marker wirklich drin ist (temporary)
+          python3 - <<'PY'
+          import zipfile
+          p="docs/source/regelwerk.docx"
+          with zipfile.ZipFile(p) as z:
+              xml = z.read("word/document.xml").decode("utf-8", errors="ignore")
+          print("DOCX_CONTAINS_TESTMARKER0=", "TESTMARKER0" in xml)
+          PY
+
           mkdir -p docs/converted
 
           # Flexibel: alle DOCX konvertieren (Dateinamen dürfen variieren)
@@ -78,10 +87,9 @@ jobs:
           test -f "docs/converted/regelwerk.txt"
           test -f "docs/converted/brandvoice.txt"
 
-
+          # DEBUG: Prüfe, ob Marker nach der Konvertierung wirklich angekommen ist (temporary)
           grep -n "TESTMARKER0" "docs/converted/regelwerk.txt" || { echo "TESTMARKER0 not found in docs/converted/regelwerk.txt"; exit 1; }
           echo "OK: TESTMARKER0 found in docs/converted/regelwerk.txt"
-
 
       - name: Create/Update OpenAI Vector Store + upload files
         id: ingest
