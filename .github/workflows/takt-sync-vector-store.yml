@@ -78,19 +78,36 @@ jobs:
           test -f "docs/converted/regelwerk.txt"
           test -f "docs/converted/brandvoice.txt"
 
-FILE=""
-if [ -f "docs/converted/regelwerk.txt" ]; then
-  FILE="docs/converted/regelwerk.txt"
-elif [ -f "docs/converted/regelwerk.md" ]; then
-  FILE="docs/converted/regelwerk.md"
-else
-  echo "ERROR: regelwerk output not found (neither .txt nor .md) in docs/converted"
-  ls -la docs/converted
-  exit 1
-fi
 
-grep -n "TESTMARKER" "$FILE" || (echo "TESTMARKER not found in $FILE" && exit 1)
-echo "OK: TESTMARKER found in $FILE"
+          
+
+      - name: Convert DOCX -> TXT (robust + flexible)
+        run: |
+          set -euxo pipefail
+
+          # ... deine Konvertierung ...
+
+          # erwartete Kernfiles (weil safe-Namen genutzt werden)
+          test -f "docs/converted/regelwerk.txt"
+          test -f "docs/converted/brandvoice.txt"
+
+          # DEBUG CHECK (temporary)
+          FILE=""
+          if [ -f "docs/converted/regelwerk.txt" ]; then
+            FILE="docs/converted/regelwerk.txt"
+          elif [ -f "docs/converted/regelwerk.md" ]; then
+            FILE="docs/converted/regelwerk.md"
+          else
+            echo "ERROR: regelwerk output not found (neither .txt nor .md) in docs/converted"
+            ls -la docs/converted
+            exit 1
+          fi
+
+          grep -n "TESTMARKER" "$FILE" || (echo "TESTMARKER not found in $FILE" && exit 1)
+          echo "OK: TESTMARKER found in $FILE"
+
+
+
 
 
       - name: Create/Update OpenAI Vector Store + upload files
