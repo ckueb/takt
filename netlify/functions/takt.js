@@ -14,6 +14,7 @@ const path = require("path");
 
 const DEFAULT_MAX_CHARS = 2000;
 const MAX_CHARS = Number(process.env.TAKT_MAX_CHARS || DEFAULT_MAX_CHARS);
+const RAG_TOPK = Math.max(0, Number(process.env.TAKT_RAG_TOPK || 6));
 
 // Structured Outputs requires models that support json_schema formatting.
 // We default to gpt-4o-mini for reliability.
@@ -409,8 +410,8 @@ exports.handler = async (event) => {
       body = {};
     }
 
-    const text = String(body.text || "").trim();
-    if (!text) return json(400, { error: "Bitte einen Kommentar im Feld „Kommentar“ einfügen." });
+    const text = String(body.text || body.Kommentar || body.kommentar || "").trim();
+    if (!text) return json(400, { error: "Bitte Text im Feld \"text\" (oder \"Kommentar\") senden." });
     if (text.length > MAX_CHARS) return json(400, { error: `Text zu lang. Maximal ${MAX_CHARS} Zeichen.` });
 
     if (text.includes("sk-")) {
@@ -429,7 +430,7 @@ exports.handler = async (event) => {
       });
     }
 
-    const snippets = retrieveSnippets(text, 6);
+    const snippets = RAG_TOPK ? retrieveSnippets(text, RAG_TOPK) : [];
     const knowledge = snippets
       .map((s) => `Quelle: ${s.source} | Abschnitt: ${s.title}\n${s.text}`)
       .join("\n\n");
