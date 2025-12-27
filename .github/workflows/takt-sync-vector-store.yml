@@ -2,7 +2,7 @@ name: "TAKT: Sync Vector Store + Deploy (robust)"
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   workflow_dispatch:
 
 jobs:
@@ -18,31 +18,32 @@ jobs:
         with:
           node-version: "20"
 
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
       - name: Install dependencies
         run: |
           set -euxo pipefail
           npm ci || npm install
 
-      - name: Install pandoc
-        run: |
-          set -euxo pipefail
-          sudo apt-get update
-          sudo apt-get install -y pandoc
-
       - name: Convert DOCX -> TXT (robust)
         run: |
           set -euxo pipefail
+
           mkdir -p docs/converted
 
-          # Strict filenames (must exist)
+          # These two are strict (must exist with exact names)
           test -f "docs/source/regelwerk.docx"
           test -f "docs/source/brandvoice.docx"
 
-          pandoc "docs/source/regelwerk.docx" -t plain -o "docs/converted/regelwerk.txt"
-          pandoc "docs/source/brandvoice.docx" -t plain -o "docs/converted/brandvoice.txt"
+          # Convert via your repo script (handles docx reliably)
+          python tools/docx_to_text.py "docs/source/regelwerk.docx" "docs/converted/regelwerk.txt"
+          python tools/docx_to_text.py "docs/source/brandvoice.docx" "docs/converted/brandvoice.txt"
 
-          # Flexible CM filename (any matching variant)
-          CM_FILE="$(ls -1 docs/source/CM-Eskalations-Konfliktanalyst*.docx 2>/dev/null | head -n 1 || true)"
+          # CM file is flexible (any matching filename, spaces ok)
+          CM_FILE="$(find docs/source -maxdepth 1 -type f -name 'CM-Eskalations-Konfliktanalyst*.docx' | head -n 1 || true)"
           if [ -z "$CM_FILE" ]; then
             echo "ERROR: Could not find docs/source/CM-Eskalations-Konfliktanalyst*.docx"
             echo "Files in docs/source/:"
@@ -51,10 +52,17 @@ jobs:
           fi
 
           echo "Using CM file: $CM_FILE"
-          pandoc "$CM_FILE" -t plain -o "docs/converted/cm.txt"
+          python tools/docx_to_text.py "$CM_FILE" "docs/converted/cm.txt"
 
           echo "Converted files:"
           ls -la docs/converted
+
+          # Safety check: must contain at least one .txt
+          TXT_COUNT="$(find docs/converted -maxdepth 1 -type f -name '*.txt' | wc -l | tr -d ' ')"
+          if [ "$TXT_COUNT" -lt 1 ]; then
+            echo "ERROR: No .txt files produced in docs/converted"
+            exit 1
+          fi
 
       - name: Create Vector Store + upload files (OpenAI)
         id: ingest
@@ -66,17 +74,24 @@ jobs:
           STORE_NAME="takt-ruleset-${GITHUB_SHA}"
           echo "Using vector store name: ${STORE_NAME}"
 
-          # Script prints JSON -> write to file
-          node tools/openai_vectorstore_sync.mjs --in docs/converted --name "${STORE_NAME}" > ingest.json
+          # Script outputs JSON -> capture it
+          node tools/openai_vectorstore_sync.mjs --in docs/converted --name "${STORE_NAME}" > ingest.out
 
           echo "----- openai_vectorstore_sync output -----"
-          cat ingest.json
+          cat ingest.out
           echo "------------------------------------------"
 
-          # Parse JSON robustly via node (no jq needed)
-          VS_ID="$(node -e "const fs=require('fs'); const j=JSON.parse(fs.readFileSync('ingest.json','utf8')); process.stdout.write((j.vector_store_id||'').trim());")"
+          # Robust parsing:
+          # 1) Try JSON key vector_store_id
+          # 2) Fallback to grep line VECTOR_STORE_ID=...
+          VS_ID="$(node -e "const fs=require('fs'); const t=fs.readFileSync('ingest.out','utf8'); try { const j=JSON.parse(t); process.stdout.write((j.vector_store_id||'').trim()); } catch(e) { process.stdout.write(''); }")"
+
           if [ -z "$VS_ID" ]; then
-            echo "ERROR: vector_store_id not found in ingest.json"
+            VS_ID="$(grep -E '^VECTOR_STORE_ID=' ingest.out | head -n 1 | cut -d= -f2 | tr -d '\r' || true)"
+          fi
+
+          if [ -z "$VS_ID" ]; then
+            echo "ERROR: vector_store_id not found in ingest output."
             exit 1
           fi
 
@@ -95,7 +110,7 @@ jobs:
 
           netlify env:set TAKT_VECTOR_STORE_ID "${{ steps.ingest.outputs.vector_store_id }}" --site "$NETLIFY_SITE_ID"
 
-      - name: Trigger Netlify deploy (Build Hook) - optional
+      - name: Trigger Netlify deploy (Build Hook) - optional but robust
         env:
           NETLIFY_BUILD_HOOK_URL: ${{ secrets.NETLIFY_BUILD_HOOK_URL }}
         run: |
