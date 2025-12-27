@@ -1,216 +1,211 @@
 /**
  * Netlify Function (CommonJS): /.netlify/functions/takt
  *
- * Ziel:
- * - Output entspricht Regelwerk-Struktur (TAKT) und Brand Voice stabil.
- * - Genau EINE öffentliche Antwort; optional EINE DM (vom System sinnvoll gesetzt).
- * - Structured Outputs (JSON Schema) + deterministisches Rendering + Quality Gate (Lint + Repair).
- *
- * Request body:
- * - { "text": "..." }  (alternativ: "Kommentar" / "kommentar")
+ * Goal: CustomGPT-like consistency without endless prompt fiddling.
+ * Approach:
+ *  - Use Structured Outputs (json_schema) for steps 0–2 + moderation action.
+ *  - Generate Step 3 (public reply + optional DM) deterministically via templates,
+ *    based on lightweight scenario detection (exit / threat / critique).
+ *  - Keep Brand Voice constraints in templates (no Behörden-/PR-Sprache, no floskeln).
  *
  * Env:
- * - OPENAI_API_KEY (required)
- * - TAKT_MODEL (default: gpt-4o-mini)
- * - TAKT_MAX_CHARS (default: 2000)
- * - TAKT_RAG_TOPK (default: 0)  // 0 = kein RAG; 1-3 = leichtes RAG
- * - TAKT_TONE (default: klar)    // klar | vorsichtig
+ *  - OPENAI_API_KEY (required)
+ *  - TAKT_MODEL (default: gpt-4.1-mini)
+ *  - TAKT_RAG_TOPK (default: 0)  // if >0, will attach snippets from takt_knowledge.json
+ *  - TAKT_DM_MODE (auto|always|never) default: auto
  */
 
 const fs = require("fs");
-const path = require("path");
 
-const DEFAULT_MODEL = process.env.TAKT_MODEL || "gpt-4o-mini";
-const DEFAULT_MAX_CHARS = 2000;
-const MAX_CHARS = Number(process.env.TAKT_MAX_CHARS || DEFAULT_MAX_CHARS);
-
-// Performance/Consistency: default RAG off for Website.
-const RAG_TOPK = Math.max(0, Number(process.env.TAKT_RAG_TOPK || 0));
-
-// Tone profile for Step 3 language.
-const TONE_PROFILE = String(process.env.TAKT_TONE || "klar").toLowerCase();
-
-let KB = null;
 let OpenAIClient = null;
 
-function json(statusCode, bodyObj, extraHeaders = {}) {
+async function getOpenAI() {
+  if (OpenAIClient) return OpenAIClient;
+  const mod = await import("openai");
+  const OpenAI = mod.default || mod.OpenAI || mod;
+  OpenAIClient = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+  return OpenAIClient;
+}
+
+function json(statusCode, body, headers = {}) {
   return {
     statusCode,
     headers: {
-      "Content-Type": "application/json; charset=utf-8",
-      "Cache-Control": "no-store",
-      ...extraHeaders,
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": "*",
+      ...headers,
     },
-    body: JSON.stringify(bodyObj),
+    body: body == null ? "" : JSON.stringify(body),
   };
 }
 
-function resolveKbPath() {
-  if (process.env.TAKT_KB_PATH) return process.env.TAKT_KB_PATH;
+function safeParseJson(str) {
+  try { return JSON.parse(str); } catch { return null; }
+}
 
-  const candidates = [
-    path.join(__dirname, "takt_knowledge.json"),
-    path.join(process.cwd(), "netlify", "functions", "takt_knowledge.json"),
-    path.join(process.cwd(), "netlify/functions/takt_knowledge.json"),
-  ];
-
-  for (const p of candidates) {
-    try {
-      if (fs.existsSync(p)) return p;
-    } catch {}
+/** -------- Knowledge (optional) -------- */
+function loadKnowledge(path) {
+  try {
+    const raw = fs.readFileSync(path, "utf8");
+    return JSON.parse(raw);
+  } catch {
+    return null;
   }
-  return candidates[0];
 }
-
-const KB_PATH = resolveKbPath();
-
-function loadKb() {
-  if (KB) return KB;
-  const raw = fs.readFileSync(KB_PATH, "utf8");
-  KB = JSON.parse(raw);
-  return KB;
-}
-
-// ---------- RAG-light (optional) ----------
-const tokenRe = /[A-Za-zÄÖÜäöüß0-9]+/g;
 
 function tokenize(s) {
-  return (String(s).match(tokenRe) || [])
-    .map((w) => w.toLowerCase())
-    .filter((w) => w.length >= 3);
+  return (s || "")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .split(/\s+/)
+    .filter(Boolean);
 }
 
-function idf(df, N) {
-  return Math.log((N + 1) / (df + 1)) + 1;
+function retrieveSnippets(query, topk) {
+  if (!topk || topk <= 0) return [];
+  const kbPath = process.env.TAKT_KB_PATH || "netlify/functions/takt_knowledge.json";
+  const kb = loadKnowledge(kbPath);
+  if (!kb || !Array.isArray(kb.chunks)) return [];
+
+  const q = tokenize(query);
+  const qset = new Set(q);
+
+  // very small, fast scorer: overlap + precomputed tf-idf (if present)
+  const scored = kb.chunks.map((c) => {
+    const t = tokenize(c.text);
+    let overlap = 0;
+    for (const w of t) if (qset.has(w)) overlap += 1;
+    const score = overlap;
+    return { score, c };
+  });
+
+  scored.sort((a, b) => b.score - a.score);
+  return scored.filter(x => x.score > 0).slice(0, topk).map(x => ({
+    source: x.c.source || "knowledge",
+    title: x.c.title || "",
+    text: x.c.text || ""
+  }));
 }
 
-function retrieveSnippets(queryText, topK = 3) {
-  const kb = loadKb();
-  const qTokens = tokenize(queryText);
-  if (qTokens.length === 0) return [];
-
-  const qtf = new Map();
-  for (const t of qTokens) qtf.set(t, (qtf.get(t) || 0) + 1);
-
-  const scores = [];
-  for (let i = 0; i < kb.chunks.length; i++) {
-    const ch = kb.chunks[i];
-    const tf = ch.tf || {};
-    let score = 0;
-
-    for (const [t, qCount] of qtf.entries()) {
-      const dCount = tf[t] || 0;
-      if (!dCount) continue;
-      const w = idf(kb.df[t] || 0, kb.chunk_count);
-      score += qCount * w * (dCount * w);
-    }
-
-    if (score > 0) scores.push({ i, score });
-  }
-
-  scores.sort((a, b) => b.score - a.score);
-  return scores.slice(0, topK).map(({ i }) => kb.chunks[i]);
-}
-
-// ---------- Prompts ----------
+/** -------- Brand Voice + Regelwerk distilled (system) -------- */
 function buildCoreSystem() {
-  return `Du bist Friedrich, Community Eskalations- und Konfliktanalyst (TAKT).
-Du arbeitest strikt nach dem verbindlichen Moderations-Regelwerk. Wenn Regeln kollidieren, hat das Regelwerk Vorrang.
+  return `
+Du bist TAKT, ein Online-Moderations- und Deeskalationsassistent.
+Du arbeitest praxisnah, deeskalierend, respektvoll und lösungsorientiert.
 
-Workflow (immer in dieser Reihenfolge):
-0 Türsteher (Moderationsblick)
-1 Analyse (Schulz von Thun, Vier-Seiten-Modell)
-2 Kompass (SIDE Modell)
-3 Tonart (GFK)
+Pflicht: Ausgabe folgt IMMER dem TAKT-Workflow:
+0. Türsteher (Moderationsblick)
+1. Analyse (Schulz von Thun)
+2. Kompass (SIDE Modell)
+3. Tonart (GFK – Antwortvorschlag)
 
-Website-Betrieb:
-- Stelle keine Rückfragen.
-- Wenn Informationen fehlen, triff die beste plausible Annahme und markiere sie kurz als „Annahme:“.
-- Entscheide auch bei Grenzfällen selbstständig und begründe knapp.
+Wichtig:
+- Keine Rechtsberatung. Keine juristische Fachsprache. Kein Behörden-Deutsch.
+- In Schritt 0 keine Legalismen wie "strafbar". Nutze stattdessen "Regelverstoß" oder "Drohung/Beleidigung".
+- Schritt 1 und 2 sind analytisch, aber in normaler Sprache (keine Lehrbuch-Abhandlung).
+- Liefere keine Variantenlisten. Genau eine Empfehlung pro Feld.
 
-Formalia:
-- Sprich konsequent in Wir-Form als Moderationsteam.
-- Keine Rechtsberatung.
-- Klar, kurz, keine Schachtelsätze. Keine Gedankenstriche im Satz.
-
-Du nutzt exakt diese sichtbaren Überschriften:
-„0. Türsteher (Moderationsblick)“
-„1. Analyse (Schulz von Thun – Nachricht entschlüsseln)“
-„2. Kompass (SIDE Modell – Community-Dynamik)“
-„3. Tonart (GFK – Antwortvorschlag)“
-
-Ausgabe-Regeln:
-- Wenn kein sofortiger Löschbedarf: schreibe exakt „Kein sofortiger Löschbedarf: Weiter mit Schritt 1.“
-- In Schritt 3: genau eine „Öffentliche Moderatorenantwort:“
-- Optional: eine „Optionale Direktnachricht an das Mitglied:“ wenn sinnvoll.
-- Zusätzlich in Schritt 3: „Empfohlene Moderationsmaßnahme: …“
-- In Schritt 3 muss mindestens ein Satz die relevante Norm und die gewünschte Botschaft aus Schritt 2 enthalten.`.trim();
+Du erzeugst STRUCTURED OUTPUT als JSON nach Schema (strict).
+  `.trim();
 }
 
 function buildStyleSystem() {
-  const tone = TONE_PROFILE === "vorsichtig" ? "vorsichtig" : "klar";
-  return `Brand Voice (verbindlich für Schritt 3, solange kein Konflikt mit Schutz/Zielen):
-Tonprofil: ${tone}.
-
-Grundstil:
+  return `
+Brand Voice (verbindlich, v. a. für Schritt 3):
 - Modern, direkt, locker aber professionell. Auf Augenhöhe.
-- Kurze klare Sätze. Alltagssprache. Kein Blabla. Keine PR-Floskeln.
-- Keine Emojis. Keine Gedankenstriche. Keine Therapie- oder Behörden-Sprache.
-- Fokus auf Verhalten und Wirkung, nicht auf Etiketten für Personen.
-
-Floskel-Verbot (Beispiele):
-- „Wenn du Hilfe benötigst …“
-- „Sprich uns gerne an …“
-- „Wir wünschen uns, dass alle …“ (wenn es leer/unkonkret bleibt)
-
-Blacklist (nicht verwenden):
-- Befund, Drohanzeige
-- prüfen, Prüfung, Maßnahmen ergreifen, Schritte einleiten
-- im Rahmen unserer Richtlinien, wir werden das intern prüfen
-
-Bevorzugte Wörter:
-- Kurzcheck (statt „Befund“)
-- Drohung, Einschüchterungsversuch, Druckversuch (statt „Drohanzeige“)
-
-GFK, aber ohne Lehrerzimmer-Ton:
-- Beobachtung: konkret („Du schreibst …“ / direktes Zitat).
-- Gefühl/Impact: kurz, passend zur Lage (bei Drohung: „Das setzt uns unter Druck.“).
-- Bedürfnis: kurz (Respekt, Sicherheit, Fairness).
-- Bitte/Grenze: konkret.
-
-Wenn der Kommentar Druck, Einschüchterung oder Drohungen enthält:
-- Keine weiche Empathie-Floskel.
-- Grenze klar in einem Satz.
-- Konsequenz ruhig und konkret, aktiv formuliert (löschen, sperren, einschränken). Keine „wir prüfen …“.
-- Nutze ein klares Wenn-Dann.
-
-Wenn jemand die Community verlassen will:
-- Keine generische Support-Antwort.
-- Bitte um einen konkreten Punkt (ein Satz reicht).
-- Biete eine kurze Direktnachricht an, um Feedback privat zu sammeln.
-
-Format Schritt 3:
-- Genau eine öffentliche Moderatorenantwort (3 bis 6 kurze Sätze).
-- Optional eine DM (2 bis 4 kurze Sätze), wenn sinnvoll.`.trim();
+- Kurze, klare Sätze. Kein Blabla. Keine PR- und keine Standardfloskeln.
+- Keine Emojis. Keine Gedankenstriche im Satz.
+- Keine Therapie-Sprache oder psychologische Fachbegriffe (z. B. "getriggert").
+- Fokus auf Verhalten und Wirkung, nicht auf Abwertung von Personen.
+  `.trim();
 }
 
-// ---------- JSON Schema (Structured Outputs, strict) ----------
+/** -------- Scenario detection (deterministic step 3) -------- */
+function detectScenario(text) {
+  const t = (text || "").toLowerCase();
+
+  const isExit = /(ich\s+verlasse|bin\s+raus|trete\s+aus|ich\s+gehe|ich\s+bin\s+weg|leaving\s+the\s+community|goodbye)/i.test(t);
+
+  const isThreat = /(sonst|anzeige|anwalt|ich\s+sorge\s+dafür|ich\s+komme\s+vorbei|wir\s+sehen\s+uns|ihr\s+werdet\s+schon\s+sehen|meld( )?e\s+euch|ruinier|dox|swat)/i.test(t);
+
+  const isPressure = /(löscht\s+das|löschen\s+sonst|macht\s+das\s+weg|wenn\s+ihr\s+nicht|ihr\s+verliert\s+mitglieder)/i.test(t);
+
+  const isCritique = /(enttäusch|schlecht|nervt|lächerlich|peinlich|unfähig|moderation|community)/i.test(t);
+
+  if (isThreat || isPressure) return "threat";
+  if (isExit) return "exit";
+  if (isCritique) return "critique";
+  return "neutral";
+}
+
+function extractShortQuote(text, maxLen = 90) {
+  const s = (text || "").trim().replace(/\s+/g, " ");
+  if (!s) return "";
+  if (s.length <= maxLen) return s;
+  return s.slice(0, maxLen - 1).trimEnd() + "…";
+}
+
+function wantsDM(dmMode, scenario) {
+  if (dmMode === "never") return false;
+  if (dmMode === "always") return true;
+  // auto
+  return scenario === "exit" || scenario === "threat";
+}
+
+function step3Templates({ scenario, originalText }) {
+  const quote = extractShortQuote(originalText);
+
+  if (scenario === "exit") {
+    return {
+      public_reply:
+        `Du schreibst, dass du hier enttäuscht bist und die Community verlässt. Kritik ist hier okay. Uns hilft sie nur, wenn sie konkret wird. Wenn du magst, schreib in einem Satz, was für dich der Punkt war, der es gekippt hat. Dann schauen wir, was wir wirklich verbessern können.`,
+      dm_reply:
+        `Ich melde mich kurz direkt, weil dein Kommentar nach einem echten Bruch klingt. Wenn du willst, schick mir knapp die zwei bis drei Punkte, die für dich entscheidend waren. Dann kann das Team daraus wirklich etwas ableiten.`
+    };
+  }
+
+  if (scenario === "threat") {
+    return {
+      public_reply:
+        `Du schreibst: „${quote}“. Drohungen oder Druck haben hier keinen Platz. Wenn das nochmal so kommt, löschen wir den Inhalt und schränken den Account ein. Wenn du Kritik hast, sag sie bitte konkret und ohne Druck.`,
+      dm_reply:
+        `Kurzer Hinweis: Bitte keine Drohungen oder Druck. Wenn du ein Problem hast, schreib es konkret. Bei weiteren Drohungen löschen wir und schränken den Account ein.`
+    };
+  }
+
+  if (scenario === "critique") {
+    return {
+      public_reply:
+        `Danke für die klare Rückmeldung. Kritik ist hier okay. Hilf uns kurz mit einem konkreten Punkt: Was genau hat dich enttäuscht, und was würdest du dir stattdessen wünschen? Dann können wir sinnvoll reagieren.`,
+      dm_reply:
+        `Wenn du magst, schreib mir kurz die ein bis zwei Punkte, die für dich am meisten gestört haben. Dann kann das Team gezielt nachsteuern.`
+    };
+  }
+
+  return {
+    public_reply:
+      `Danke für deinen Beitrag. Wenn du magst, sag kurz konkret, worum es dir geht. Dann können wir gezielt reagieren.`,
+    dm_reply:
+      `Wenn du möchtest, schreib mir kurz, was genau du meinst. Dann kann das Team besser helfen.`
+  };
+}
+
+/** -------- Schema -------- */
 const TAKT_SCHEMA = {
   type: "object",
   additionalProperties: false,
   properties: {
-    language: { type: "string", enum: ["de"] },
     step0: {
       type: "object",
       additionalProperties: false,
       properties: {
-        risk: { type: "string", enum: ["niedrig", "mittel", "hoch", "kritisch"] },
-        decision: { type: "string", enum: ["sofort_entfernen", "stehen_lassen"] },
-        violations: { type: "array", maxItems: 6, items: { type: "string" } },
-        rationale: { type: "string" },
-        assumption: { type: "string" },
+        risiko: { type: "string", enum: ["niedrig", "mittel", "hoch", "kritisch"] },
+        kurzcheck: { type: "string" },
+        empfehlung: { type: "string" },
+        begruendung: { type: "string" },
+        assumption: { type: "string" }
       },
-      required: ["risk", "decision", "violations", "rationale", "assumption"],
+      required: ["risiko", "kurzcheck", "empfehlung", "begruendung", "assumption"]
     },
     step1: {
       type: "object",
@@ -219,9 +214,9 @@ const TAKT_SCHEMA = {
         sachebene: { type: "string" },
         selbstoffenbarung: { type: "string" },
         beziehungsebene: { type: "string" },
-        appell: { type: "string" },
+        appell: { type: "string" }
       },
-      required: ["sachebene", "selbstoffenbarung", "beziehungsebene", "appell"],
+      required: ["sachebene", "selbstoffenbarung", "beziehungsebene", "appell"]
     },
     step2: {
       type: "object",
@@ -229,512 +224,171 @@ const TAKT_SCHEMA = {
       properties: {
         ingroup_outgroup: { type: "string" },
         normen: { type: "string" },
-        botschaft: { type: "string" },
+        botschaft: { type: "string" }
       },
-      required: ["ingroup_outgroup", "normen", "botschaft"],
+      required: ["ingroup_outgroup", "normen", "botschaft"]
     },
     step3: {
       type: "object",
       additionalProperties: false,
       properties: {
         public_reply: { type: "string" },
-        include_dm: { type: "boolean" },
         dm_reply: { type: "string" },
-        action: { type: "string" },
+        moderation_massnahme: {
+          type: "string",
+          enum: ["stehen_lassen", "antworten", "loeschen", "verwarnen", "einschraenken", "sperren"]
+        }
       },
-      required: ["public_reply", "include_dm", "dm_reply", "action"],
-    },
+      required: ["public_reply", "dm_reply", "moderation_massnahme"]
+    }
   },
-  required: ["language", "step0", "step1", "step2", "step3"],
+  required: ["step0", "step1", "step2", "step3"]
 };
 
-// ---------- OpenAI Client ----------
-async function getOpenAI() {
-  if (OpenAIClient) return OpenAIClient;
-
-  const mod = await import("openai");
-  const OpenAI = mod.default || mod.OpenAI || mod;
-  OpenAIClient = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-  return OpenAIClient;
-}
-
-function extractOutputText(response) {
-  if (!response) return "";
-  if (typeof response.output_text === "string" && response.output_text.trim()) {
-    return response.output_text.trim();
-  }
-  try {
-    const out = Array.isArray(response.output) ? response.output : [];
-    for (const item of out) {
-      const content = Array.isArray(item.content) ? item.content : [];
-      for (const c of content) {
-        if (c && c.type === "output_text" && typeof c.text === "string") {
-          const t = c.text.trim();
-          if (t) return t;
-        }
-      }
-    }
-  } catch {}
-  return "";
-}
-
-// ---------- Rendering + Lint ----------
-function containsEmoji(s) {
-  return /[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/u.test(s);
-}
-
-function validateRenderedText(txt) {
-  const errors = [];
-
-  const requiredHeadings = [
-    "0. Türsteher (Moderationsblick)",
-    "1. Analyse (Schulz von Thun – Nachricht entschlüsseln)",
-    "2. Kompass (SIDE Modell – Community-Dynamik)",
-    "3. Tonart (GFK – Antwortvorschlag)",
-  ];
-
-  for (const h of requiredHeadings) {
-    if (!txt.includes(h)) errors.push(`Fehlende Überschrift: ${h}`);
-  }
-
-  const publicCount = (txt.match(/Öffentliche Moderatorenantwort:/g) || []).length;
-  if (publicCount !== 1) errors.push("Schritt 3 muss genau eine öffentliche Moderatorenantwort enthalten.");
-
-  const dmCount = (txt.match(/Optionale Direktnachricht an das Mitglied:/g) || []).length;
-  if (dmCount > 1) errors.push("Es darf höchstens eine optionale Direktnachricht geben.");
-
-  if (/[–—]/.test(txt)) errors.push("Gedankenstriche (–/—) sind nicht erlaubt.");
-  if (containsEmoji(txt)) errors.push("Emojis sind nicht erlaubt.");
-
-  // Brand-Voice Lint: Büro-/Behördenwörter + leere Support-Floskeln
-  const bannedPatterns = [
-    /\bBefund\b/i,
-    /\bDrohanzeige\b/i,
-    /\b(prüfen|Prüfung|geprüft|prüfen\s+wir)\b/i,
-    /\bMaßnahmen\s+(ergreifen|einleiten)\b/i,
-    /\bSchritte\s+einleiten\b/i,
-    /\b(im\s+Rahmen\s+unserer\s+Richtlinien)\b/i,
-    /\b(intern\s+prüfen|interne\s+Prüfung)\b/i,
-    /\bWenn\s+du\s+Hilfe\s+benötigst\b/i,
-    /\bsprich\s+uns\s+gerne\s+an\b/i,
-  ];
-  for (const re of bannedPatterns) {
-    if (re.test(txt)) {
-      errors.push("Brand Voice: Büro-/Behördensprache oder generische Floskel gefunden. Bitte alltagstauglich, konkret und aktiv formulieren.");
-      break;
-    }
-  }
-
-  // Semantik-Lint: typische Fehlparaphrase im Droh-Fall
-  if (/droh\w*\s+.*mitglieder\s+zu\s+verlieren/i.test(txt)) {
-    errors.push("Schritt 3: Formulierung wirkt unlogisch (z. B. ‚du drohst, Mitglieder zu verlieren‘). Bitte korrekt paraphrasieren (‚dass Mitglieder die Gruppe verlassen‘) oder direkt zitieren.");
-  }
-
-  const highRisk = /Risiko:\s*(hoch|kritisch)\./i.test(txt);
-  if (highRisk) {
-    if (/Man\s+merkt,?\s+dass\s+dich/i.test(txt)) {
-      errors.push("Brand Voice: Bei Drohung/Einschüchterung keine weiche Empathie-Floskel („Man merkt ...“).");
-    }
-    const hasConcreteAction = /(löschen|entfernen|sperren|stummschalten|einschränken|verwarnen)/i.test(txt);
-    if (!hasConcreteAction) {
-      errors.push("Schritt 3: Bei hohem/kritischem Risiko muss die Konsequenz aktiv und konkret benannt werden (löschen, sperren, einschränken...).");
-    }
-  }
-
-  // Exit-Signal: bitte konkret nach einem Punkt fragen + DM anbieten
-  const exitSignal = /\bverlass(e|en|t)\b/i.test(txt) || /\bbin\s+raus\b/i.test(txt) || /\btrete\s+aus\b/i.test(txt);
-  if (exitSignal) {
-    if (!/Optionale Direktnachricht an das Mitglied:/g.test(txt)) {
-      errors.push("Schritt 3: Bei Austrittsankündigung ist eine optionale Direktnachricht sinnvoll. Bitte hinzufügen.");
-    }
-    const hasConcreteAsk = /\?/.test(txt) && /(was\s+war\s+der\s+punkt|welcher\s+punkt|in\s+einem\s+satz|zwei\s+oder\s+drei\s+punkte)/i.test(txt);
-    if (!hasConcreteAsk) {
-      errors.push("Schritt 3: Bitte stelle eine konkrete, kurze Frage (z. B. „Was war der Punkt, der es gekippt hat?“).");
-    }
-  }
-
-  return errors;
-}
-
-function renderTAKT(data) {
-  const s0 = data.step0 || {};
-  const s1 = data.step1 || {};
-  const s2 = data.step2 || {};
-  const s3 = data.step3 || {};
+/** -------- Renderer (Regelwerk headings) -------- */
+function render(output, { includeDM }) {
+  const s0 = output.step0 || {};
+  const s1 = output.step1 || {};
+  const s2 = output.step2 || {};
+  const s3 = output.step3 || {};
 
   const lines = [];
 
-  // 0
-  lines.push("0. Türsteher (Moderationsblick)");
-  lines.push(`Risiko: ${s0.risk || "mittel"}.`);
-  if (Array.isArray(s0.violations) && s0.violations.length) {
-    lines.push(`Kurzcheck: ${s0.violations.join(", ")}.`);
+  lines.push(`0. Türsteher (Moderationsblick)`);
+  lines.push(``);
+  lines.push(`Risiko: ${s0.risiko}.`);
+  lines.push(`Kurzcheck: ${s0.kurzcheck}`.trim());
+  lines.push(`Empfehlung: ${s0.empfehlung}`.trim());
+  lines.push(`Begründung: ${s0.begruendung}`.trim());
+  lines.push(``);
+  // Pflichtsatz aus Regelwerk-Logik
+  if (/stehen|bleib/i.test(s0.empfehlung || "")) {
+    lines.push(`Kein sofortiger Löschbedarf: Weiter mit Schritt 1.`);
   } else {
-    lines.push("Kurzcheck: Keine klaren Regelverstöße erkennbar.");
-  }
-  lines.push(`Empfehlung: ${s0.decision === "sofort_entfernen" ? "Kommentar entfernen oder Account einschränken." : "Kann stehen bleiben. Weiter analysieren."}`);
-  lines.push(`Begründung: ${String(s0.rationale || "").trim()}`.trim());
-
-  if (s0.assumption && String(s0.assumption).trim()) {
-    lines.push(`Annahme: ${String(s0.assumption).trim()}`);
+    lines.push(`Weiter mit Schritt 1.`);
   }
 
-  if (s0.decision !== "sofort_entfernen") {
-    lines.push("Kein sofortiger Löschbedarf: Weiter mit Schritt 1.");
+  lines.push(``);
+  lines.push(`1. Analyse (Schulz von Thun – Nachricht entschlüsseln)`);
+  lines.push(``);
+  lines.push(`Sachebene: ${s1.sachebene}`.trim());
+  lines.push(``);
+  lines.push(`Selbstoffenbarung: ${s1.selbstoffenbarung}`.trim());
+  lines.push(``);
+  lines.push(`Beziehungsebene: ${s1.beziehungsebene}`.trim());
+  lines.push(``);
+  lines.push(`Appell: ${s1.appell}`.trim());
+
+  lines.push(``);
+  lines.push(`2. Kompass (SIDE Modell – Community-Dynamik)`);
+  lines.push(``);
+  lines.push(`Ingroup / Outgroup (vermutet): ${s2.ingroup_outgroup}`.trim());
+  lines.push(``);
+  lines.push(`Relevante Norm(en): ${s2.normen}`.trim());
+  lines.push(``);
+  lines.push(`Gewünschte Botschaft an die Community: ${s2.botschaft}`.trim());
+
+  lines.push(``);
+  lines.push(`3. Tonart (GFK – Antwortvorschlag)`);
+  lines.push(``);
+  lines.push(`Öffentliche Moderatorenantwort:`);
+  lines.push(``);
+  lines.push(`${s3.public_reply}`.trim());
+
+  if (includeDM) {
+    lines.push(``);
+    lines.push(`Optionale Direktnachricht an das Mitglied:`);
+    lines.push(``);
+    lines.push(`${s3.dm_reply}`.trim());
   }
 
-  lines.push("");
+  lines.push(``);
+  lines.push(`Empfohlene Moderationsmaßnahme: ${s3.moderation_massnahme}`.trim());
 
-  // 1
-  lines.push("1. Analyse (Schulz von Thun – Nachricht entschlüsseln)");
-  lines.push(`Sachebene: ${String(s1.sachebene || "").trim()}`.trim());
-  lines.push(`Selbstoffenbarung: ${String(s1.selbstoffenbarung || "").trim()}`.trim());
-  lines.push(`Beziehungsebene: ${String(s1.beziehungsebene || "").trim()}`.trim());
-  lines.push(`Appell: ${String(s1.appell || "").trim()}`.trim());
-
-  lines.push("");
-
-  // 2
-  lines.push("2. Kompass (SIDE Modell – Community-Dynamik)");
-  lines.push(`Ingroup / Outgroup (vermutet): ${String(s2.ingroup_outgroup || "").trim()}`.trim());
-  lines.push(`Relevante Norm(en): ${String(s2.normen || "").trim()}`.trim());
-  lines.push(`Gewünschte Botschaft an die Community: ${String(s2.botschaft || "").trim()}`.trim());
-
-  lines.push("");
-
-  // 3
-  lines.push("3. Tonart (GFK – Antwortvorschlag)");
-  lines.push("Öffentliche Moderatorenantwort:");
-  lines.push(String(s3.public_reply || "").trim());
-
-  if (s3.include_dm) {
-    const dm = String(s3.dm_reply || "").trim();
-    lines.push("");
-    lines.push("Optionale Direktnachricht an das Mitglied:");
-    lines.push(dm || "Keine Direktnachricht empfohlen.");
-  }
-
-  lines.push("");
-  lines.push(`Empfohlene Moderationsmaßnahme: ${String(s3.action || "").trim()}`.trim());
-
-  return lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+  return lines.join("\n");
 }
 
-// ---------- Deterministische Step-3-Verbesserungen (CustomGPT-Nähe) ----------
-function shortenOneOrTwoSentences(s, maxLen = 170) {
-  const t = String(s || "").trim();
-  if (!t) return "";
-  const parts = t.split(/(?<=[.!?])\s+/).filter(Boolean);
-  const out = [];
-  for (const p of parts) {
-    if (!p.trim()) continue;
-    out.push(p.trim());
-    if (out.join(" ").length >= maxLen || out.length >= 2) break;
-  }
-  let joined = out.join(" ");
-  if (joined.length > maxLen) joined = joined.slice(0, maxLen - 1).trimEnd() + "…";
-  return joined;
-}
-
-function extractQuoteSnippet(originalText, maxLen = 120) {
-  const t = String(originalText || "").replace(/\s+/g, " ").trim();
-  if (!t) return "";
-  const snippet = t.length > maxLen ? t.slice(0, maxLen).trimEnd() + "…" : t;
-  return snippet.replace(/\n/g, " ");
-}
-
-function isCoercionOrThreat(originalText) {
-  const t = String(originalText || "").toLowerCase();
-  return (
-    /\bsonst\b/.test(t) ||
-    /ich\s+sorge\s+dafür/.test(t) ||
-    /mitglieder\s+verlier/.test(t) ||
-    /\bdroh/.test(t) ||
-    /\berpress/.test(t) ||
-    /\bunter\s+druck\b/.test(t)
-  );
-}
-
-function isExitSignal(originalText) {
-  const t = String(originalText || "").toLowerCase();
-  return (
-    /\bverlass(e|en|t)\b/.test(t) ||
-    /\bich\s+geh(e|e\s+jetzt)\b/.test(t) ||
-    /\bbin\s+raus\b/.test(t) ||
-    /\btrete\s+aus\b/.test(t) ||
-    /\bcommunity\s+verlass/.test(t)
-  );
-}
-
-function enforceStep3ForThreat(parsed, originalText) {
-  if (!parsed || !parsed.step3 || !parsed.step0 || !parsed.step2) return parsed;
-
-  const risk = String(parsed.step0.risk || "").toLowerCase();
-  const high = risk === "hoch" || risk === "kritisch";
-  const coercion = isCoercionOrThreat(originalText);
-
-  if (!(high && coercion)) return parsed;
-
-  const quote = extractQuoteSnippet(originalText);
-  const norm = shortenOneOrTwoSentences(parsed.step2.normen, 140);
-  const msg = shortenOneOrTwoSentences(parsed.step2.botschaft, 140);
-
-  const publicLines = [];
-  if (quote) publicLines.push(`Du schreibst: „${quote}“.`);
-  publicLines.push("Das ist ein Druckversuch und so läuft das hier nicht.");
-  if (norm || msg) {
-    const pieces = [];
-    if (norm) pieces.push(`Hier gilt: ${norm}`);
-    if (msg) pieces.push(msg);
-    publicLines.push(pieces.join(" ").replace(/\s+/g, " ").trim());
-  } else {
-    publicLines.push("Bitte bleib respektvoll und ohne Drohungen.");
-  }
-  publicLines.push("Formuliere deinen Punkt ohne Druck oder Drohungen, dann bleiben wir im Gespräch.");
-  publicLines.push("Wenn du weiter drohst oder Druck machst, löschen wir solche Beiträge und sperren den Account bei Wiederholung.");
-
-  const dmLines = [];
-  dmLines.push("Hi, kurz direkt: Dein Kommentar war ein Druckversuch.");
-  dmLines.push("Bitte formuliere ohne Drohungen. Sonst löschen wir und sperren bei Wiederholung.");
-  dmLines.push("Wenn du dein Anliegen sachlich schreibst, schauen wir drauf.");
-
-  parsed.step3.public_reply = publicLines.join(" ");
-  parsed.step3.include_dm = true;
-  parsed.step3.dm_reply = dmLines.join(" ");
-  if (!/(löschen|entfernen|sperren|einschränken|verwarnen)/i.test(String(parsed.step3.action || ""))) {
-    parsed.step3.action = "sofort_entfernen. Kommentar entfernen. Bei Wiederholung sperren oder einschränken.";
-  }
-
-  return parsed;
-}
-
-function enforceStep3ForExit(parsed, originalText) {
-  if (!parsed || !parsed.step3 || !parsed.step0 || !parsed.step2) return parsed;
-
-  const risk = String(parsed.step0.risk || "").toLowerCase();
-  const high = risk === "hoch" || risk === "kritisch";
-  if (high) return parsed;
-  if (!isExitSignal(originalText)) return parsed;
-
-  const quote = extractQuoteSnippet(originalText);
-  const norm = shortenOneOrTwoSentences(parsed.step2.normen, 140);
-  const msg = shortenOneOrTwoSentences(parsed.step2.botschaft, 140);
-
-  const publicLines = [];
-  if (quote) publicLines.push(`Du schreibst: „${quote}“.`);
-  publicLines.push("Das klingt nach einem klaren Cut.");
-
-  const pieces = [];
-  if (norm) pieces.push(`Hier gilt: ${norm}`);
-  else pieces.push("Kritik ist hier okay, solange sie respektvoll bleibt.");
-  if (msg) pieces.push(msg);
-  else pieces.push("Uns hilft Kritik am meisten, wenn sie konkret wird.");
-  publicLines.push(pieces.join(" ").replace(/\s+/g, " ").trim());
-
-  publicLines.push("Wenn du magst, sag in einem Satz, was für dich der Punkt war, der es gekippt hat.");
-  publicLines.push("Wenn du das lieber privat schreibst, schick es uns kurz per Direktnachricht.");
-
-  const dmLines = [];
-  dmLines.push("Hi, wir melden uns kurz direkt, weil dein Kommentar nach einem echten Bruch klingt.");
-  dmLines.push("Wenn du magst, schreib uns knapp zwei oder drei Punkte, die dich am meisten enttäuscht haben.");
-  dmLines.push("Kein Roman. Je konkreter, desto besser können wir daraus etwas verbessern.");
-
-  parsed.step3.public_reply = publicLines.join(" ");
-  parsed.step3.include_dm = true;
-  parsed.step3.dm_reply = dmLines.join(" ");
-  if (!String(parsed.step3.action || "").trim() || /stehen_lassen/i.test(String(parsed.step3.action))) {
-    parsed.step3.action = "stehen_lassen. Kurz öffentlich antworten. Optional per DM nach konkreten Punkten fragen. Intern als Feedback markieren.";
-  }
-
-  return parsed;
-}
-
-// ---------- API Calls ----------
-async function createStructuredTAKT(client, { systemCore, systemStyle, knowledge, userText }) {
-  const r = await client.responses.create({
-    model: DEFAULT_MODEL,
-    input: [
-      { role: "system", content: systemCore },
-      { role: "system", content: systemStyle },
-      { role: "system", content: knowledge ? `WISSENSKONTEXT (Auszüge, nur falls relevant):\n${knowledge}` : "WISSENSKONTEXT: (leer)" },
-      {
-        role: "user",
-        content:
-          `Analysiere den folgenden Kommentar strikt nach TAKT und gib das Ergebnis ausschließlich im JSON Schema aus.
-
-Wichtig:
-- Fülle ALLE Felder.
-- Nutze alltagstaugliche Wörter.
-- Schritt 1/2: bleib konkret (1–2 Sätze je Feld). Appell auch indirekt erkennen.
-- Schritt 3: keine generischen Support-Sätze. Nutze Beobachtung („Du schreibst …“) + konkrete Bitte/Frage.
-- Bei Drohung/Einschüchterung: keine weiche Empathie. Klare Grenze + konkrete Konsequenz (löschen, sperren, einschränken).
-- Bei Austritt/Abschied: bitte um einen konkreten Punkt und biete eine Direktnachricht an.
-- Wenn du keine Annahme brauchst, setze step0.assumption auf einen leeren String.
-- Wenn include_dm = false, setze step3.dm_reply auf einen leeren String.
-
-Kommentar:
-${userText}`,
-      },
-    ],
-    text: {
-      format: {
-        type: "json_schema",
-        name: "takt_output",
-        strict: true,
-        schema: TAKT_SCHEMA,
-      },
-    },
-    max_output_tokens: 850,
-  });
-
-  return r;
-}
-
-async function repairIfNeeded(client, { systemCore, systemStyle, knowledge, previousJson, validationErrors }) {
-  const r = await client.responses.create({
-    model: DEFAULT_MODEL,
-    input: [
-      { role: "system", content: systemCore },
-      { role: "system", content: systemStyle },
-      { role: "system", content: knowledge ? `WISSENSKONTEXT (Auszüge, nur falls relevant):\n${knowledge}` : "WISSENSKONTEXT: (leer)" },
-      {
-        role: "user",
-        content:
-          `Dein vorheriger Output verletzt Format- oder Stilregeln.
-
-Fehlerliste:
-- ${validationErrors.join("\n- ")}
-
-Korrigiere ausschließlich Form und Stil. Inhaltliche Aussagen nur wenn zwingend nötig, damit die Regeln erfüllt sind.
-Gib wieder ausschließlich JSON im selben Schema aus.
-
-Vorheriges JSON:
-${JSON.stringify(previousJson)}`,
-      },
-    ],
-    text: {
-      format: {
-        type: "json_schema",
-        name: "takt_output",
-        strict: true,
-        schema: TAKT_SCHEMA,
-      },
-    },
-    max_output_tokens: 850,
-  });
-
-  return r;
-}
-
-// ---------- Handler ----------
+/** -------- Main handler -------- */
 exports.handler = async (event) => {
   try {
     if ((event.httpMethod || "").toUpperCase() === "OPTIONS") {
       return json(204, {}, {
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Headers": "Content-Type",
-        "Access-Control-Allow-Methods": "POST, OPTIONS",
+        "Access-Control-Allow-Methods": "POST, OPTIONS"
       });
     }
 
     if ((event.httpMethod || "").toUpperCase() !== "POST") {
-      return json(405, { error: "Nur POST erlaubt." });
+      return json(405, { error: "Method not allowed. Use POST." }, { "Allow": "POST, OPTIONS" });
     }
 
-    let body = {};
-    try {
-      body = JSON.parse(event.body || "{}");
-    } catch {
-      body = {};
-    }
+    const body = safeParseJson(event.body || "{}") || {};
+    const text = (body.text || body.kommentar || body.Kommentar || "").toString().trim();
+    const mode = (body.mode || "website").toString();
 
-    const text = String(body.text || body.Kommentar || body.kommentar || "").trim();
-    if (!text) return json(400, { error: "Bitte Text im Feld \"text\" (oder \"Kommentar\") senden." });
-    if (text.length > MAX_CHARS) return json(400, { error: `Text zu lang. Maximal ${MAX_CHARS} Zeichen.` });
+    if (!text) return json(400, { error: "Missing 'text' in request body." });
 
-    if (text.includes("sk-")) {
-      return json(400, { error: "Bitte keine Schlüssel oder Zugangsdaten einfügen." });
-    }
-
-    if (!process.env.OPENAI_API_KEY) {
-      return json(500, { error: "OPENAI_API_KEY fehlt in Netlify Environment Variables." });
-    }
-
-    // Knowledge is optional. If the file is missing and RAG_TOPK is 0, we can still run.
-    let knowledge = "";
-    if (RAG_TOPK > 0) {
-      if (!fs.existsSync(KB_PATH)) {
-        return json(500, {
-          error: "Knowledge-Datei nicht gefunden.",
-          kb_path_tried: KB_PATH,
-          hint: "Lege netlify/functions/takt_knowledge.json ins Repo. In netlify.toml: included_files = [\"netlify/functions/takt_knowledge.json\"]. Optional: TAKT_KB_PATH setzen.",
-        });
-      }
-      const snippets = retrieveSnippets(text, Math.min(3, RAG_TOPK));
-      knowledge = snippets.map((s) => `Quelle: ${s.source} | Abschnitt: ${s.title}\n${s.text}`).join("\n\n");
-    }
+    const topk = Number(process.env.TAKT_RAG_TOPK || "0");
+    const snippets = retrieveSnippets(text, topk);
+    const knowledge = snippets.length
+      ? snippets.map((s) => `Quelle: ${s.source}${s.title ? " | " + s.title : ""}\n${s.text}`).join("\n\n")
+      : "";
 
     const client = await getOpenAI();
-    const systemCore = buildCoreSystem();
-    const systemStyle = buildStyleSystem();
 
-    // 1) Structured output -> parse JSON
-    let r = await createStructuredTAKT(client, { systemCore, systemStyle, knowledge, userText: text });
-    let raw = extractOutputText(r);
-    let parsed;
+    // Ask model for steps 0-2 + recommended moderation action (step3.moderation_massnahme).
+    // Step 3 text itself will be replaced by deterministic templates.
+    const r = await client.responses.create({
+      model: process.env.TAKT_MODEL || "gpt-4.1-mini",
+      input: [
+        { role: "system", content: buildCoreSystem() },
+        { role: "system", content: buildStyleSystem() },
+        ...(knowledge ? [{ role: "system", content: `WISSENSKONTEXT (Auszüge, nur falls relevant):\n${knowledge}` }] : []),
+        { role: "user", content: `Analysiere den folgenden Kommentar nach TAKT. Gib JSON nach Schema zurück.\n\nKommentar:\n${text}` }
+      ],
+      text: {
+        format: {
+          type: "json_schema",
+          name: "takt_output",
+          strict: true,
+          schema: TAKT_SCHEMA
+        }
+      },
+      max_output_tokens: 700
+    });
 
-    try {
-      parsed = JSON.parse(raw);
-    } catch {
-      // One retry focused on valid JSON
-      r = await createStructuredTAKT(client, { systemCore, systemStyle, knowledge, userText: `Gib ausschließlich gültiges JSON gemäß Schema aus.\n\n${text}` });
-      raw = extractOutputText(r);
-      parsed = JSON.parse(raw);
+    const raw = (r.output_text || "").trim();
+    const parsed = safeParseJson(raw);
+    if (!parsed) {
+      return json(500, { error: "Model did not return valid JSON.", raw });
     }
 
-    // 2) Deterministic Step-3 upgrades (CustomGPT-Nähe)
-    parsed = enforceStep3ForThreat(parsed, text);
-    parsed = enforceStep3ForExit(parsed, text);
+    // Deterministic Step 3 upgrade
+    const scenario = detectScenario(text);
+    const dmMode = (process.env.TAKT_DM_MODE || "auto").toLowerCase();
+    const includeDM = wantsDM(dmMode, scenario);
 
-    // 3) Render deterministically
-    let rendered = renderTAKT(parsed);
+    const templates = step3Templates({ scenario, originalText: text });
+    parsed.step3.public_reply = templates.public_reply;
+    parsed.step3.dm_reply = includeDM ? templates.dm_reply : "";
+    // keep model's recommended moderation action (already in parsed.step3.moderation_massnahme)
 
-    // 4) Validate + targeted repair (bis zu 2 Versuche)
-    let errors = validateRenderedText(rendered);
-    if (parsed?.step0?.decision !== "sofort_entfernen" && !rendered.includes("Kein sofortiger Löschbedarf: Weiter mit Schritt 1.")) {
-      errors.push("Pflichtsatz fehlt: Kein sofortiger Löschbedarf: Weiter mit Schritt 1.");
-    }
-
-    let attempts = 0;
-    while (errors.length && attempts < 2) {
-      attempts += 1;
-      const r2 = await repairIfNeeded(client, { systemCore, systemStyle, knowledge, previousJson: parsed, validationErrors: errors });
-      const raw2 = extractOutputText(r2);
-      const parsed2 = JSON.parse(raw2);
-
-      // Re-apply deterministic rules after repair (keeps tone stable)
-      let fixed = enforceStep3ForThreat(parsed2, text);
-      fixed = enforceStep3ForExit(fixed, text);
-
-      const rendered2 = renderTAKT(fixed);
-      const errors2 = validateRenderedText(rendered2);
-
-      parsed = fixed;
-      rendered = rendered2;
-      errors = errors2;
-    }
+    const outputText = render(parsed, { includeDM });
 
     return json(200, {
-      output: rendered,
+      output: outputText,
       meta: {
-        model: DEFAULT_MODEL,
-        rag_topk: RAG_TOPK,
-        tone: (TONE_PROFILE === "vorsichtig" ? "vorsichtig" : "klar"),
-        warnings: errors.length ? errors : undefined,
-      },
+        mode,
+        scenario,
+        rag_topk: topk,
+        dm_mode: dmMode,
+        dm_included: includeDM
+      }
     });
+
   } catch (e) {
     console.error("TAKT function error:", e);
-    return json(500, { error: "Serverfehler. Bitte später erneut versuchen." });
+    return json(500, { error: String(e && e.message ? e.message : e) });
   }
 };
