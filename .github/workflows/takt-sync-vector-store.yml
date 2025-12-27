@@ -22,6 +22,7 @@ jobs:
       - name: Install dependencies
         run: |
           set -euxo pipefail
+          cd "$GITHUB_WORKSPACE"
           npm install
 
       - name: Install pandoc
@@ -75,7 +76,6 @@ jobs:
 
           echo "vector_store_id=$VS_ID" >> "$GITHUB_OUTPUT"
           echo "Vector Store created: $VS_ID"
-
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
 
@@ -83,10 +83,8 @@ jobs:
         run: |
           set -euxo pipefail
 
-          npm i -g netlify-cli
           echo "Setting TAKT_VECTOR_STORE_ID=${{ steps.ingest.outputs.vector_store_id }}"
-
-          netlify env:set TAKT_VECTOR_STORE_ID "${{ steps.ingest.outputs.vector_store_id }}" --site "$NETLIFY_SITE_ID"
+          npx netlify-cli env:set TAKT_VECTOR_STORE_ID "${{ steps.ingest.outputs.vector_store_id }}" --site "$NETLIFY_SITE_ID"
         env:
           NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
           NETLIFY_SITE_ID: ${{ secrets.NETLIFY_SITE_ID }}
