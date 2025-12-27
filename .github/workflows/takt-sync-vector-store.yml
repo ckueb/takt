@@ -78,6 +78,9 @@ jobs:
           test -f "docs/converted/regelwerk.txt"
           test -f "docs/converted/brandvoice.txt"
 
+grep -n "TESTMARKER" docs/converted/regelwerk.txt \
+  || (echo "TESTMARKER not found in docs/converted/regelwerk.txt" && exit 1)
+
       - name: Create/Update OpenAI Vector Store + upload files
         id: ingest
         run: |
