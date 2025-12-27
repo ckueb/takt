@@ -2,8 +2,7 @@ name: "TAKT: Sync Vector Store + Deploy (robust)"
 
 on:
   push:
-    branches:
-      - main
+    branches: [ "main" ]
   workflow_dispatch:
 
 jobs:
@@ -22,8 +21,7 @@ jobs:
       - name: Install dependencies
         run: |
           set -euxo pipefail
-          cd "$GITHUB_WORKSPACE"
-          npm install
+          npm ci || npm install
 
       - name: Install pandoc
         run: |
@@ -34,14 +32,16 @@ jobs:
       - name: Convert DOCX -> TXT (robust)
         run: |
           set -euxo pipefail
-
           mkdir -p docs/converted
 
-          # These two are strict (must exist with exact names)
+          # Strict filenames (must exist)
+          test -f "docs/source/regelwerk.docx"
+          test -f "docs/source/brandvoice.docx"
+
           pandoc "docs/source/regelwerk.docx" -t plain -o "docs/converted/regelwerk.txt"
           pandoc "docs/source/brandvoice.docx" -t plain -o "docs/converted/brandvoice.txt"
 
-          # This one is flexible (any matching filename)
+          # Flexible CM filename (any matching variant)
           CM_FILE="$(ls -1 docs/source/CM-Eskalations-Konfliktanalyst*.docx 2>/dev/null | head -n 1 || true)"
           if [ -z "$CM_FILE" ]; then
             echo "ERROR: Could not find docs/source/CM-Eskalations-Konfliktanalyst*.docx"
@@ -58,45 +58,53 @@ jobs:
 
       - name: Create Vector Store + upload files (OpenAI)
         id: ingest
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
           set -euxo pipefail
 
           STORE_NAME="takt-ruleset-${GITHUB_SHA}"
-          echo "Using vector store name: $STORE_NAME"
+          echo "Using vector store name: ${STORE_NAME}"
 
-          # The script must print a line like: VECTOR_STORE_ID=vs_...
-          node tools/openai_vectorstore_sync.mjs --in docs/converted --name "$STORE_NAME" > ingest.out
+          # Script prints JSON -> write to file
+          node tools/openai_vectorstore_sync.mjs --in docs/converted --name "${STORE_NAME}" > ingest.json
 
           echo "----- openai_vectorstore_sync output -----"
-          cat ingest.out
+          cat ingest.json
           echo "------------------------------------------"
 
-          VS_ID="$(grep '^VECTOR_STORE_ID=' ingest.out | head -n 1 | cut -d= -f2 | tr -d '\r' || true)"
+          # Parse JSON robustly via node (no jq needed)
+          VS_ID="$(node -e "const fs=require('fs'); const j=JSON.parse(fs.readFileSync('ingest.json','utf8')); process.stdout.write((j.vector_store_id||'').trim());")"
           if [ -z "$VS_ID" ]; then
-            echo "ERROR: VECTOR_STORE_ID not found in script output."
+            echo "ERROR: vector_store_id not found in ingest.json"
             exit 1
           fi
 
           echo "vector_store_id=$VS_ID" >> "$GITHUB_OUTPUT"
           echo "Vector Store created: $VS_ID"
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
 
       - name: Set Netlify env var (TAKT_VECTOR_STORE_ID)
-        run: |
-          set -euxo pipefail
-
-          echo "Setting TAKT_VECTOR_STORE_ID=${{ steps.ingest.outputs.vector_store_id }}"
-          npx netlify-cli env:set TAKT_VECTOR_STORE_ID "${{ steps.ingest.outputs.vector_store_id }}" --site "$NETLIFY_SITE_ID"
         env:
           NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
           NETLIFY_SITE_ID: ${{ secrets.NETLIFY_SITE_ID }}
-
-      - name: Trigger Netlify deploy (Build Hook)
         run: |
           set -euxo pipefail
 
-          echo "Deploying with TAKT_VECTOR_STORE_ID=${{ steps.ingest.outputs.vector_store_id }}"
-          curl -s -X POST "$NETLIFY_BUILD_HOOK_URL"
+          npm i -g netlify-cli
+          echo "Setting TAKT_VECTOR_STORE_ID=${{ steps.ingest.outputs.vector_store_id }}"
+
+          netlify env:set TAKT_VECTOR_STORE_ID "${{ steps.ingest.outputs.vector_store_id }}" --site "$NETLIFY_SITE_ID"
+
+      - name: Trigger Netlify deploy (Build Hook) - optional
         env:
           NETLIFY_BUILD_HOOK_URL: ${{ secrets.NETLIFY_BUILD_HOOK_URL }}
+        run: |
+          set -euxo pipefail
+
+          if [ -z "${NETLIFY_BUILD_HOOK_URL:-}" ]; then
+            echo "No NETLIFY_BUILD_HOOK_URL set -> skipping deploy hook."
+            exit 0
+          fi
+
+          echo "Deploying with TAKT_VECTOR_STORE_ID=${{ steps.ingest.outputs.vector_store_id }}"
+          curl -s -X POST "$NETLIFY_BUILD_HOOK_URL"
