@@ -40,35 +40,30 @@ jobs:
 
           mkdir -p docs/converted
 
-          # These two are strict (must exist with exact names)
-          test -f "docs/source/regelwerk.docx"
-          test -f "docs/source/brandvoice.docx"
+          echo "Files in docs/source:"
+          ls -la docs/source
 
-          # Convert via your repo script (handles docx reliably)
-          python tools/docx_to_text.py "docs/source/regelwerk.docx" "docs/converted/regelwerk.txt"
-          python tools/docx_to_text.py "docs/source/brandvoice.docx" "docs/converted/brandvoice.txt"
+          # Convert ALL .docx in docs/source into .txt in docs/converted
+          python tools/docx_to_text.py docs/source docs/converted
 
-          # CM file is flexible (any matching filename, spaces ok)
-          CM_FILE="$(find docs/source -maxdepth 1 -type f -name 'CM-Eskalations-Konfliktanalyst*.docx' | head -n 1 || true)"
-          if [ -z "$CM_FILE" ]; then
-            echo "ERROR: Could not find docs/source/CM-Eskalations-Konfliktanalyst*.docx"
-            echo "Files in docs/source/:"
-            ls -la docs/source
-            exit 1
-          fi
-
-          echo "Using CM file: $CM_FILE"
-          python tools/docx_to_text.py "$CM_FILE" "docs/converted/cm.txt"
-
-          echo "Converted files:"
+          echo "Files in docs/converted:"
           ls -la docs/converted
 
-          # Safety check: must contain at least one .txt
-          TXT_COUNT="$(find docs/converted -maxdepth 1 -type f -name '*.txt' | wc -l | tr -d ' ')"
-          if [ "$TXT_COUNT" -lt 1 ]; then
-            echo "ERROR: No .txt files produced in docs/converted"
+          # Ensure strict required outputs exist (basename -> .txt)
+          test -f docs/converted/regelwerk.txt
+          test -f docs/converted/brandvoice.txt
+
+          # Create a stable alias for the CM file (whatever exact filename is)
+          CM_TXT="$(ls -1 docs/converted/CM-Eskalations-Konfliktanalyst*.txt 2>/dev/null | head -n 1 || true)"
+          if [ -z "$CM_TXT" ]; then
+            echo "ERROR: Could not find CM-Eskalations-Konfliktanalyst*.txt in docs/converted"
+            echo "Converted files:"
+            ls -la docs/converted
             exit 1
           fi
+
+          cp "$CM_TXT" docs/converted/cm.txt
+          echo "Using CM file: $CM_TXT -> docs/converted/cm.txt"
 
       - name: Create Vector Store + upload files (OpenAI)
         id: ingest
