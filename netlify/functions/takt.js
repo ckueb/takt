@@ -5,10 +5,16 @@
  *   { "text": "..." }
  *
  * Optional:
- *   { "text": "...", "mode": "website", "options": { "public_variants": 2, "dm_variants": 1 } }
- *
- * This variant uses OpenAI Vector Stores + file_search for Regelwerk/Brandvoice/Instructions.
- * Weekly updates are handled by GitHub Actions updating TAKT_VECTOR_STORE_ID on Netlify.
+ *   {
+ *     "text": "...",
+ *     "mode": "website",
+ *     "options": {
+ *       "public_variants": 1,
+ *       "dm_variants": 0,
+ *       "debug": true,
+ *       "force_rag": true
+ *     }
+ *   }
  */
 const DEFAULT_MODEL = process.env.TAKT_MODEL || "gpt-4.1-mini";
 const MAX_CHARS = Number(process.env.TAKT_MAX_CHARS || 2000);
@@ -61,7 +67,7 @@ function buildCoreSystem() {
 }
 
 function buildUserInstruction({ text, mode, publicVariants, dmVariants }) {
-  const header = [
+  return [
     "Analysiere den folgenden Kommentar strikt nach TAKT.",
     "Wichtig:",
     `- Modus: ${mode || "website"}`,
@@ -73,7 +79,6 @@ function buildUserInstruction({ text, mode, publicVariants, dmVariants }) {
     "Kommentar:",
     text,
   ].join("\n");
-  return header;
 }
 
 async function getOpenAIClient() {
@@ -82,41 +87,14 @@ async function getOpenAIClient() {
   return new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 }
 
-exports.handler = async (event) => {
-  try {
-    if ((event.httpMethod || "").toUpperCase() === "OPTIONS") {
-      return json(204, {});
-    }
-
-    const body = event.body ? JSON.parse(event.body) : {};
-    const text = safeTrim(body.text);
-    const mode = safeTrim(body.mode) || "website";
-    const options = body.options || {};
-
-    if (!text) return json(400, { error: "Missing text" });
-    if (text.length > MAX_CHARS) return json(400, { error: `Text too long (max ${MAX_CHARS})` });
-
-    const publicVariants = clampInt(options.public_variants, 1, 4, 1);
-    const dmVariants = clampInt(options.dm_variants, 0, 4, 0);
-
-    const vectorStoreId = safeTrim(process.env.TAKT_VECTOR_STORE_ID);
-    if (!vectorStoreId) {
-      return json(500, { error: "Missing TAKT_VECTOR_STORE_ID on server. Sync workflow not run yet." });
-    }
-
-    const client = await getOpenAIClient();
-
-    // ... oben bleibt alles gleich
-
-function pickFileSearchResults(resp) {
-  const out = Array.isArray(resp.output) ? resp.output : [];
+function extractFileSearchResults(response) {
+  const out = Array.isArray(response.output) ? response.output : [];
   const calls = out.filter((x) => x && x.type === "file_search_call");
-  // Je nach SDK-Version können die Ergebnisse an unterschiedlichen Stellen hängen.
-  // "include: ['file_search_call.results']" sorgt dafür, dass "results" vorhanden ist. :contentReference[oaicite:2]{index=2}
+
   const results = [];
   for (const c of calls) {
     const r = c.results || c.file_search_call?.results || [];
-    for (const item of (Array.isArray(r) ? r : [])) results.push(item);
+    if (Array.isArray(r)) results.push(...r);
   }
   return results;
 }
@@ -138,9 +116,9 @@ exports.handler = async (event) => {
     const publicVariants = clampInt(options.public_variants, 1, 4, 1);
     const dmVariants = clampInt(options.dm_variants, 0, 4, 0);
 
-    // DEBUG FLAGS (request-gesteuert)
-    const debug = !!options.debug;                 // -> liefert file_search Treffer mit aus
-    const forceFileSearch = !!options.force_rag;   // -> erzwingt file_search tool call
+    // Debug flags (nur zum Testen)
+    const debug = !!options.debug;
+    const forceRag = !!options.force_rag;
 
     const vectorStoreId = safeTrim(process.env.TAKT_VECTOR_STORE_ID);
     if (!vectorStoreId) {
@@ -149,7 +127,7 @@ exports.handler = async (event) => {
 
     const client = await getOpenAIClient();
 
-    const response = await client.responses.create({
+    const req = {
       model: DEFAULT_MODEL,
       input: [
         { role: "system", content: buildCoreSystem() },
@@ -158,28 +136,27 @@ exports.handler = async (event) => {
       tools: [{
         type: "file_search",
         vector_store_ids: [vectorStoreId],
-        max_num_results: RAG_TOPK, // wenn 0 => du bekommst garantiert keine Treffer zurück
+        max_num_results: RAG_TOPK,
       }],
-      // B) Debug: file_search Ergebnisse mitsenden lassen :contentReference[oaicite:3]{index=3}
-      include: debug ? ["file_search_call.results"] : undefined,
-
-      // C) Debug: Tool erzwingen (sonst kann das Modell "ohne" antworten) :contentReference[oaicite:4]{index=4}
-      tool_choice: forceFileSearch ? { type: "file_search" } : "auto",
-
+      tool_choice: forceRag ? { type: "file_search" } : "auto",
       max_output_tokens: 900,
-    });
+    };
 
-    const outputText = (response.output_text || "").trim();
-
-    if (!debug) {
-      return json(200, { output: outputText });
+    if (debug) {
+      req.include = ["file_search_call.results"];
     }
 
-    // Debug-Ausgabe (gekürzt)
-    const fsResults = pickFileSearchResults(response)
+    const response = await client.responses.create(req);
+
+    const output = (response.output_text || "").trim();
+
+    if (!debug) {
+      return json(200, { output });
+    }
+
+    const fsResults = extractFileSearchResults(response)
       .slice(0, 8)
       .map((r) => ({
-        // je nach Ergebnisform können Felder leicht anders heißen, daher defensiv:
         score: r.score,
         file_id: r.file_id || r.file?.id,
         filename: r.filename || r.file?.filename,
@@ -187,11 +164,11 @@ exports.handler = async (event) => {
       }));
 
     return json(200, {
-      output: outputText,
+      output,
       debug: {
         vector_store_id: vectorStoreId,
         rag_topk: RAG_TOPK,
-        tool_choice: forceFileSearch ? "force:file_search" : "auto",
+        tool_choice: forceRag ? "force:file_search" : "auto",
         file_search_results_count: fsResults.length,
         file_search_results: fsResults,
       },
