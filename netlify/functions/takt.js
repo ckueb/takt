@@ -1,28 +1,34 @@
 /**
  * Netlify Function (CommonJS): /.netlify/functions/takt
- * Endpoint: /.netlify/functions/takt
- * Request body: { "text": "..." }
  *
- * Goal:
- * - Output matches TAKT-Regelwerk headings and Brand Voice consistently.
- * - Exactly ONE public reply; optional ONE DM.
- * - Uses Structured Outputs (JSON Schema) + deterministic server-side rendering.
+ * Ziel:
+ * - Output entspricht Regelwerk-Struktur (TAKT) und Brand Voice stabil.
+ * - Genau EINE öffentliche Antwort; optional EINE DM (vom System sinnvoll gesetzt).
+ * - Structured Outputs (JSON Schema) + deterministisches Rendering + Quality Gate (Lint + Repair).
+ *
+ * Request body:
+ * - { "text": "..." }  (alternativ: "Kommentar" / "kommentar")
+ *
+ * Env:
+ * - OPENAI_API_KEY (required)
+ * - TAKT_MODEL (default: gpt-4o-mini)
+ * - TAKT_MAX_CHARS (default: 2000)
+ * - TAKT_RAG_TOPK (default: 0)  // 0 = kein RAG; 1-3 = leichtes RAG
+ * - TAKT_TONE (default: klar)    // klar | vorsichtig
  */
 
 const fs = require("fs");
 const path = require("path");
 
+const DEFAULT_MODEL = process.env.TAKT_MODEL || "gpt-4o-mini";
 const DEFAULT_MAX_CHARS = 2000;
 const MAX_CHARS = Number(process.env.TAKT_MAX_CHARS || DEFAULT_MAX_CHARS);
-const RAG_TOPK = Math.max(0, Number(process.env.TAKT_RAG_TOPK || 6));
 
-// Tone profile for Step 3 language. Defaults to "klar".
-// Allowed values: "klar" | "vorsichtig" (anything else falls back to "klar").
+// Performance/Consistency: default RAG off for Website.
+const RAG_TOPK = Math.max(0, Number(process.env.TAKT_RAG_TOPK || 0));
+
+// Tone profile for Step 3 language.
 const TONE_PROFILE = String(process.env.TAKT_TONE || "klar").toLowerCase();
-
-// Structured Outputs requires models that support json_schema formatting.
-// We default to gpt-4o-mini for reliability.
-const DEFAULT_MODEL = process.env.TAKT_MODEL || "gpt-4o-mini";
 
 let KB = null;
 let OpenAIClient = null;
@@ -42,7 +48,6 @@ function json(statusCode, bodyObj, extraHeaders = {}) {
 function resolveKbPath() {
   if (process.env.TAKT_KB_PATH) return process.env.TAKT_KB_PATH;
 
-  // In Netlify Functions, __dirname points to the deployed function folder.
   const candidates = [
     path.join(__dirname, "takt_knowledge.json"),
     path.join(process.cwd(), "netlify", "functions", "takt_knowledge.json"),
@@ -66,7 +71,7 @@ function loadKb() {
   return KB;
 }
 
-// RAG-light retrieval (used only as optional context, not as primary rule source)
+// ---------- RAG-light (optional) ----------
 const tokenRe = /[A-Za-zÄÖÜäöüß0-9]+/g;
 
 function tokenize(s) {
@@ -79,7 +84,7 @@ function idf(df, N) {
   return Math.log((N + 1) / (df + 1)) + 1;
 }
 
-function retrieveSnippets(queryText, topK = 6) {
+function retrieveSnippets(queryText, topK = 3) {
   const kb = loadKb();
   const qTokens = tokenize(queryText);
   if (qTokens.length === 0) return [];
@@ -107,9 +112,8 @@ function retrieveSnippets(queryText, topK = 6) {
   return scores.slice(0, topK).map(({ i }) => kb.chunks[i]);
 }
 
+// ---------- Prompts ----------
 function buildCoreSystem() {
-  // IMPORTANT: Regelwerk rules come first.
-  // Website mode: no follow-up questions, best plausible assumption if needed.
   return `Du bist Friedrich, Community Eskalations- und Konfliktanalyst (TAKT).
 Du arbeitest strikt nach dem verbindlichen Moderations-Regelwerk. Wenn Regeln kollidieren, hat das Regelwerk Vorrang.
 
@@ -122,13 +126,11 @@ Workflow (immer in dieser Reihenfolge):
 Website-Betrieb:
 - Stelle keine Rückfragen.
 - Wenn Informationen fehlen, triff die beste plausible Annahme und markiere sie kurz als „Annahme:“.
-- Bei kritischen Grenzfällen entscheide selbstständig und begründe knapp.
+- Entscheide auch bei Grenzfällen selbstständig und begründe knapp.
 
 Formalia:
 - Sprich konsequent in Wir-Form als Moderationsteam.
 - Keine Rechtsberatung.
-- Vermeide Behörden- und Prozesssprache wie „wir prüfen Maßnahmen“, „wir leiten Schritte ein“, „im Rahmen unserer Richtlinien“.
-- Wenn du einen nächsten Schritt nennen musst, nenne ihn aktiv und konkret (löschen, verwarnen, sperren, einschränken).
 - Klar, kurz, keine Schachtelsätze. Keine Gedankenstriche im Satz.
 
 Du nutzt exakt diese sichtbaren Überschriften:
@@ -140,7 +142,7 @@ Du nutzt exakt diese sichtbaren Überschriften:
 Ausgabe-Regeln:
 - Wenn kein sofortiger Löschbedarf: schreibe exakt „Kein sofortiger Löschbedarf: Weiter mit Schritt 1.“
 - In Schritt 3: genau eine „Öffentliche Moderatorenantwort:“
-- Optional: eine „Optionale Direktnachricht an das Mitglied:“ nur wenn wirklich sinnvoll.
+- Optional: eine „Optionale Direktnachricht an das Mitglied:“ wenn sinnvoll.
 - Zusätzlich in Schritt 3: „Empfohlene Moderationsmaßnahme: …“
 - In Schritt 3 muss mindestens ein Satz die relevante Norm und die gewünschte Botschaft aus Schritt 2 enthalten.`.trim();
 }
@@ -156,34 +158,43 @@ Grundstil:
 - Keine Emojis. Keine Gedankenstriche. Keine Therapie- oder Behörden-Sprache.
 - Fokus auf Verhalten und Wirkung, nicht auf Etiketten für Personen.
 
+Floskel-Verbot (Beispiele):
+- „Wenn du Hilfe benötigst …“
+- „Sprich uns gerne an …“
+- „Wir wünschen uns, dass alle …“ (wenn es leer/unkonkret bleibt)
+
 Blacklist (nicht verwenden):
 - Befund, Drohanzeige
 - prüfen, Prüfung, Maßnahmen ergreifen, Schritte einleiten
 - im Rahmen unserer Richtlinien, wir werden das intern prüfen
 
 Bevorzugte Wörter:
-- Drohung, Einschüchterungsversuch, Druckversuch (statt „Drohanzeige“)
 - Kurzcheck (statt „Befund“)
+- Drohung, Einschüchterungsversuch, Druckversuch (statt „Drohanzeige“)
 
 GFK, aber ohne Lehrerzimmer-Ton:
-- Beobachtung: konkret („In deinem Kommentar steht …“).
-- Impact statt Pädagogik: „Das setzt uns unter Druck.“ / „Das ist eine Drohung.“
+- Beobachtung: konkret („Du schreibst …“ / direktes Zitat).
+- Gefühl/Impact: kurz, passend zur Lage (bei Drohung: „Das setzt uns unter Druck.“).
 - Bedürfnis: kurz (Respekt, Sicherheit, Fairness).
 - Bitte/Grenze: konkret.
 
 Wenn der Kommentar Druck, Einschüchterung oder Drohungen enthält:
-- Keine weiche Empathie-Floskel („Man merkt, dass …“).
+- Keine weiche Empathie-Floskel.
 - Grenze klar in einem Satz.
 - Konsequenz ruhig und konkret, aktiv formuliert (löschen, sperren, einschränken). Keine „wir prüfen …“.
- - Nutze ein klares Wenn-Dann: „Wenn du Druck machst oder drohst, löschen wir solche Beiträge und sperren den Account bei Wiederholung.“
+- Nutze ein klares Wenn-Dann.
 
-Format:
+Wenn jemand die Community verlassen will:
+- Keine generische Support-Antwort.
+- Bitte um einen konkreten Punkt (ein Satz reicht).
+- Biete eine kurze Direktnachricht an, um Feedback privat zu sammeln.
+
+Format Schritt 3:
 - Genau eine öffentliche Moderatorenantwort (3 bis 6 kurze Sätze).
-- Optional eine DM nur, wenn sie wirklich sinnvoll ist.
-`.trim();
+- Optional eine DM (2 bis 4 kurze Sätze), wenn sinnvoll.`.trim();
 }
 
-// JSON Schema for Structured Outputs
+// ---------- JSON Schema (Structured Outputs, strict) ----------
 const TAKT_SCHEMA = {
   type: "object",
   additionalProperties: false,
@@ -195,15 +206,10 @@ const TAKT_SCHEMA = {
       properties: {
         risk: { type: "string", enum: ["niedrig", "mittel", "hoch", "kritisch"] },
         decision: { type: "string", enum: ["sofort_entfernen", "stehen_lassen"] },
-        violations: {
-          type: "array",
-          maxItems: 6,
-          items: { type: "string" },
-        },
+        violations: { type: "array", maxItems: 6, items: { type: "string" } },
         rationale: { type: "string" },
         assumption: { type: "string" },
       },
-      // Structured Outputs (strict) requires: required includes EVERY key in properties.
       required: ["risk", "decision", "violations", "rationale", "assumption"],
     },
     step1: {
@@ -236,17 +242,16 @@ const TAKT_SCHEMA = {
         dm_reply: { type: "string" },
         action: { type: "string" },
       },
-      // Structured Outputs (strict) requires: required includes EVERY key in properties.
       required: ["public_reply", "include_dm", "dm_reply", "action"],
     },
   },
   required: ["language", "step0", "step1", "step2", "step3"],
 };
 
+// ---------- OpenAI Client ----------
 async function getOpenAI() {
   if (OpenAIClient) return OpenAIClient;
 
-  // Works even if the SDK is ESM-only:
   const mod = await import("openai");
   const OpenAI = mod.default || mod.OpenAI || mod;
   OpenAIClient = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -258,7 +263,6 @@ function extractOutputText(response) {
   if (typeof response.output_text === "string" && response.output_text.trim()) {
     return response.output_text.trim();
   }
-  // Fallback: try to find first text block
   try {
     const out = Array.isArray(response.output) ? response.output : [];
     for (const item of out) {
@@ -274,8 +278,8 @@ function extractOutputText(response) {
   return "";
 }
 
+// ---------- Rendering + Lint ----------
 function containsEmoji(s) {
-  // Heuristic: common emoji ranges
   return /[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/u.test(s);
 }
 
@@ -302,7 +306,7 @@ function validateRenderedText(txt) {
   if (/[–—]/.test(txt)) errors.push("Gedankenstriche (–/—) sind nicht erlaubt.");
   if (containsEmoji(txt)) errors.push("Emojis sind nicht erlaubt.");
 
-  // Brand-Voice Lint: Büro-/Behördenwörter und passiv-vage Prozesssprache
+  // Brand-Voice Lint: Büro-/Behördenwörter + leere Support-Floskeln
   const bannedPatterns = [
     /\bBefund\b/i,
     /\bDrohanzeige\b/i,
@@ -311,35 +315,44 @@ function validateRenderedText(txt) {
     /\bSchritte\s+einleiten\b/i,
     /\b(im\s+Rahmen\s+unserer\s+Richtlinien)\b/i,
     /\b(intern\s+prüfen|interne\s+Prüfung)\b/i,
+    /\bWenn\s+du\s+Hilfe\s+benötigst\b/i,
+    /\bsprich\s+uns\s+gerne\s+an\b/i,
   ];
   for (const re of bannedPatterns) {
     if (re.test(txt)) {
-      errors.push("Brand Voice: Büro-/Behördensprache gefunden. Bitte alltagstauglich und aktiv formulieren.");
+      errors.push("Brand Voice: Büro-/Behördensprache oder generische Floskel gefunden. Bitte alltagstauglich, konkret und aktiv formulieren.");
       break;
     }
   }
 
-  // Semantik-Lint: typische Fehlparaphrase im Druck-/Einschüchterungsfall
-  if (/droh\w*\s+.*,?\s*mitglieder\s+zu\s+verlieren/i.test(txt) || /droh\w*\s+mitglieder\s+zu\s+verlieren/i.test(txt)) {
-    errors.push("Schritt 3: Formulierung wirkt unlogisch (z. B. ‚du drohst, Mitglieder zu verlieren‘). Bitte direkt zitieren oder korrekt paraphrasieren (‚dass Mitglieder die Gruppe verlassen‘). ");
+  // Semantik-Lint: typische Fehlparaphrase im Droh-Fall
+  if (/droh\w*\s+.*mitglieder\s+zu\s+verlieren/i.test(txt)) {
+    errors.push("Schritt 3: Formulierung wirkt unlogisch (z. B. ‚du drohst, Mitglieder zu verlieren‘). Bitte korrekt paraphrasieren (‚dass Mitglieder die Gruppe verlassen‘) oder direkt zitieren.");
   }
 
   const highRisk = /Risiko:\s*(hoch|kritisch)\./i.test(txt);
   if (highRisk) {
-    // Bei Drohung/Einschüchterung: kein "Lehrerzimmer"-Empathiesatz
     if (/Man\s+merkt,?\s+dass\s+dich/i.test(txt)) {
       errors.push("Brand Voice: Bei Drohung/Einschüchterung keine weiche Empathie-Floskel („Man merkt ...“).");
     }
-
-    // Bei hohem Risiko muss die Konsequenz konkret sein (aktiv).
     const hasConcreteAction = /(löschen|entfernen|sperren|stummschalten|einschränken|verwarnen)/i.test(txt);
     if (!hasConcreteAction) {
       errors.push("Schritt 3: Bei hohem/kritischem Risiko muss die Konsequenz aktiv und konkret benannt werden (löschen, sperren, einschränken...).");
     }
   }
 
-  // Regelwerk: Wenn stehen_lassen, muss der Satz exakt vorkommen.
-  // Wir checken das im Renderer zusätzlich, aber hier als Sicherheitsnetz.
+  // Exit-Signal: bitte konkret nach einem Punkt fragen + DM anbieten
+  const exitSignal = /\bverlass(e|en|t)\b/i.test(txt) || /\bbin\s+raus\b/i.test(txt) || /\btrete\s+aus\b/i.test(txt);
+  if (exitSignal) {
+    if (!/Optionale Direktnachricht an das Mitglied:/g.test(txt)) {
+      errors.push("Schritt 3: Bei Austrittsankündigung ist eine optionale Direktnachricht sinnvoll. Bitte hinzufügen.");
+    }
+    const hasConcreteAsk = /\?/.test(txt) && /(was\s+war\s+der\s+punkt|welcher\s+punkt|in\s+einem\s+satz|zwei\s+oder\s+drei\s+punkte)/i.test(txt);
+    if (!hasConcreteAsk) {
+      errors.push("Schritt 3: Bitte stelle eine konkrete, kurze Frage (z. B. „Was war der Punkt, der es gekippt hat?“).");
+    }
+  }
+
   return errors;
 }
 
@@ -357,9 +370,9 @@ function renderTAKT(data) {
   if (Array.isArray(s0.violations) && s0.violations.length) {
     lines.push(`Kurzcheck: ${s0.violations.join(", ")}.`);
   } else {
-    lines.push("Kurzcheck: Keine klaren strafbaren Inhalte erkennbar.");
+    lines.push("Kurzcheck: Keine klaren Regelverstöße erkennbar.");
   }
-  lines.push(`Empfehlung: ${s0.decision === "sofort_entfernen" ? "Kommentar löschen oder Account einschränken." : "Kann stehen bleiben. Weiter analysieren."}`);
+  lines.push(`Empfehlung: ${s0.decision === "sofort_entfernen" ? "Kommentar entfernen oder Account einschränken." : "Kann stehen bleiben. Weiter analysieren."}`);
   lines.push(`Begründung: ${String(s0.rationale || "").trim()}`.trim());
 
   if (s0.assumption && String(s0.assumption).trim()) {
@@ -407,6 +420,7 @@ function renderTAKT(data) {
   return lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 
+// ---------- Deterministische Step-3-Verbesserungen (CustomGPT-Nähe) ----------
 function shortenOneOrTwoSentences(s, maxLen = 170) {
   const t = String(s || "").trim();
   if (!t) return "";
@@ -441,14 +455,24 @@ function isCoercionOrThreat(originalText) {
   );
 }
 
-function enforceStep3ForClarity(parsed, originalText) {
+function isExitSignal(originalText) {
+  const t = String(originalText || "").toLowerCase();
+  return (
+    /\bverlass(e|en|t)\b/.test(t) ||
+    /\bich\s+geh(e|e\s+jetzt)\b/.test(t) ||
+    /\bbin\s+raus\b/.test(t) ||
+    /\btrete\s+aus\b/.test(t) ||
+    /\bcommunity\s+verlass/.test(t)
+  );
+}
+
+function enforceStep3ForThreat(parsed, originalText) {
   if (!parsed || !parsed.step3 || !parsed.step0 || !parsed.step2) return parsed;
 
   const risk = String(parsed.step0.risk || "").toLowerCase();
   const high = risk === "hoch" || risk === "kritisch";
   const coercion = isCoercionOrThreat(originalText);
 
-  // Only hard-enforce for high-risk coercion/threat cases.
   if (!(high && coercion)) return parsed;
 
   const quote = extractQuoteSnippet(originalText);
@@ -477,22 +501,62 @@ function enforceStep3ForClarity(parsed, originalText) {
   parsed.step3.public_reply = publicLines.join(" ");
   parsed.step3.include_dm = true;
   parsed.step3.dm_reply = dmLines.join(" ");
-
-  // Also enforce a concrete action if the model gave something vague.
   if (!/(löschen|entfernen|sperren|einschränken|verwarnen)/i.test(String(parsed.step3.action || ""))) {
-    parsed.step3.action = "Kommentar löschen. Bei Wiederholung verwarnen oder sperren.";
+    parsed.step3.action = "sofort_entfernen. Kommentar entfernen. Bei Wiederholung sperren oder einschränken.";
   }
 
   return parsed;
 }
 
+function enforceStep3ForExit(parsed, originalText) {
+  if (!parsed || !parsed.step3 || !parsed.step0 || !parsed.step2) return parsed;
+
+  const risk = String(parsed.step0.risk || "").toLowerCase();
+  const high = risk === "hoch" || risk === "kritisch";
+  if (high) return parsed;
+  if (!isExitSignal(originalText)) return parsed;
+
+  const quote = extractQuoteSnippet(originalText);
+  const norm = shortenOneOrTwoSentences(parsed.step2.normen, 140);
+  const msg = shortenOneOrTwoSentences(parsed.step2.botschaft, 140);
+
+  const publicLines = [];
+  if (quote) publicLines.push(`Du schreibst: „${quote}“.`);
+  publicLines.push("Das klingt nach einem klaren Cut.");
+
+  const pieces = [];
+  if (norm) pieces.push(`Hier gilt: ${norm}`);
+  else pieces.push("Kritik ist hier okay, solange sie respektvoll bleibt.");
+  if (msg) pieces.push(msg);
+  else pieces.push("Uns hilft Kritik am meisten, wenn sie konkret wird.");
+  publicLines.push(pieces.join(" ").replace(/\s+/g, " ").trim());
+
+  publicLines.push("Wenn du magst, sag in einem Satz, was für dich der Punkt war, der es gekippt hat.");
+  publicLines.push("Wenn du das lieber privat schreibst, schick es uns kurz per Direktnachricht.");
+
+  const dmLines = [];
+  dmLines.push("Hi, wir melden uns kurz direkt, weil dein Kommentar nach einem echten Bruch klingt.");
+  dmLines.push("Wenn du magst, schreib uns knapp zwei oder drei Punkte, die dich am meisten enttäuscht haben.");
+  dmLines.push("Kein Roman. Je konkreter, desto besser können wir daraus etwas verbessern.");
+
+  parsed.step3.public_reply = publicLines.join(" ");
+  parsed.step3.include_dm = true;
+  parsed.step3.dm_reply = dmLines.join(" ");
+  if (!String(parsed.step3.action || "").trim() || /stehen_lassen/i.test(String(parsed.step3.action))) {
+    parsed.step3.action = "stehen_lassen. Kurz öffentlich antworten. Optional per DM nach konkreten Punkten fragen. Intern als Feedback markieren.";
+  }
+
+  return parsed;
+}
+
+// ---------- API Calls ----------
 async function createStructuredTAKT(client, { systemCore, systemStyle, knowledge, userText }) {
   const r = await client.responses.create({
     model: DEFAULT_MODEL,
     input: [
       { role: "system", content: systemCore },
       { role: "system", content: systemStyle },
-      { role: "system", content: `WISSENSKONTEXT (Auszüge, nur falls relevant):\n${knowledge}` },
+      { role: "system", content: knowledge ? `WISSENSKONTEXT (Auszüge, nur falls relevant):\n${knowledge}` : "WISSENSKONTEXT: (leer)" },
       {
         role: "user",
         content:
@@ -500,8 +564,11 @@ async function createStructuredTAKT(client, { systemCore, systemStyle, knowledge
 
 Wichtig:
 - Fülle ALLE Felder.
-- Nutze alltagstaugliche Wörter (z. B. „Drohung“ statt „Drohanzeige“).
-- Bei Drohung/Einschüchterung: keine weiche Empathie-Floskel. Nenne eine klare Grenze und eine konkrete Konsequenz (löschen, sperren, einschränken).
+- Nutze alltagstaugliche Wörter.
+- Schritt 1/2: bleib konkret (1–2 Sätze je Feld). Appell auch indirekt erkennen.
+- Schritt 3: keine generischen Support-Sätze. Nutze Beobachtung („Du schreibst …“) + konkrete Bitte/Frage.
+- Bei Drohung/Einschüchterung: keine weiche Empathie. Klare Grenze + konkrete Konsequenz (löschen, sperren, einschränken).
+- Bei Austritt/Abschied: bitte um einen konkreten Punkt und biete eine Direktnachricht an.
 - Wenn du keine Annahme brauchst, setze step0.assumption auf einen leeren String.
 - Wenn include_dm = false, setze step3.dm_reply auf einen leeren String.
 
@@ -517,23 +584,32 @@ ${userText}`,
         schema: TAKT_SCHEMA,
       },
     },
-    max_output_tokens: 800,
+    max_output_tokens: 850,
   });
 
   return r;
 }
 
-async function repairIfNeeded(client, { systemCore, systemStyle, knowledge, userText, previousJson, validationErrors }) {
+async function repairIfNeeded(client, { systemCore, systemStyle, knowledge, previousJson, validationErrors }) {
   const r = await client.responses.create({
     model: DEFAULT_MODEL,
     input: [
       { role: "system", content: systemCore },
       { role: "system", content: systemStyle },
-      { role: "system", content: `WISSENSKONTEXT (Auszüge, nur falls relevant):\n${knowledge}` },
+      { role: "system", content: knowledge ? `WISSENSKONTEXT (Auszüge, nur falls relevant):\n${knowledge}` : "WISSENSKONTEXT: (leer)" },
       {
         role: "user",
         content:
-          `Dein vorheriger Output verletzt Format- oder Stilregeln.\n\nFehlerliste:\n- ${validationErrors.join("\n- ")}\n\nKorrigiere ausschließlich Form und Stil. Inhaltliche Aussagen nur wenn zwingend nötig, damit die Regeln erfüllt sind.\nGib wieder ausschließlich JSON im selben Schema aus.\n\nVorheriges JSON:\n${JSON.stringify(previousJson)}`,
+          `Dein vorheriger Output verletzt Format- oder Stilregeln.
+
+Fehlerliste:
+- ${validationErrors.join("\n- ")}
+
+Korrigiere ausschließlich Form und Stil. Inhaltliche Aussagen nur wenn zwingend nötig, damit die Regeln erfüllt sind.
+Gib wieder ausschließlich JSON im selben Schema aus.
+
+Vorheriges JSON:
+${JSON.stringify(previousJson)}`,
       },
     ],
     text: {
@@ -544,12 +620,13 @@ async function repairIfNeeded(client, { systemCore, systemStyle, knowledge, user
         schema: TAKT_SCHEMA,
       },
     },
-    max_output_tokens: 800,
+    max_output_tokens: 850,
   });
 
   return r;
 }
 
+// ---------- Handler ----------
 exports.handler = async (event) => {
   try {
     if ((event.httpMethod || "").toUpperCase() === "OPTIONS") {
@@ -583,78 +660,66 @@ exports.handler = async (event) => {
       return json(500, { error: "OPENAI_API_KEY fehlt in Netlify Environment Variables." });
     }
 
-    if (!fs.existsSync(KB_PATH)) {
-      return json(500, {
-        error: "Knowledge-Datei nicht gefunden.",
-        kb_path_tried: KB_PATH,
-        hint: "Lege netlify/functions/takt_knowledge.json ins Repo. In netlify.toml: [functions].included_files = [\"netlify/functions/takt_knowledge.json\"]. Optional: TAKT_KB_PATH setzen.",
-      });
+    // Knowledge is optional. If the file is missing and RAG_TOPK is 0, we can still run.
+    let knowledge = "";
+    if (RAG_TOPK > 0) {
+      if (!fs.existsSync(KB_PATH)) {
+        return json(500, {
+          error: "Knowledge-Datei nicht gefunden.",
+          kb_path_tried: KB_PATH,
+          hint: "Lege netlify/functions/takt_knowledge.json ins Repo. In netlify.toml: included_files = [\"netlify/functions/takt_knowledge.json\"]. Optional: TAKT_KB_PATH setzen.",
+        });
+      }
+      const snippets = retrieveSnippets(text, Math.min(3, RAG_TOPK));
+      knowledge = snippets.map((s) => `Quelle: ${s.source} | Abschnitt: ${s.title}\n${s.text}`).join("\n\n");
     }
 
-    const snippets = RAG_TOPK ? retrieveSnippets(text, RAG_TOPK) : [];
-    const knowledge = snippets
-      .map((s) => `Quelle: ${s.source} | Abschnitt: ${s.title}\n${s.text}`)
-      .join("\n\n");
-
     const client = await getOpenAI();
-
     const systemCore = buildCoreSystem();
     const systemStyle = buildStyleSystem();
 
     // 1) Structured output -> parse JSON
-    let r = await createStructuredTAKT(client, {
-      systemCore,
-      systemStyle,
-      knowledge,
-      userText: text,
-    });
-
+    let r = await createStructuredTAKT(client, { systemCore, systemStyle, knowledge, userText: text });
     let raw = extractOutputText(r);
     let parsed;
+
     try {
       parsed = JSON.parse(raw);
-    } catch (e) {
-      // If parsing fails (should be rare with json_schema), do one repair pass.
-      r = await createStructuredTAKT(client, {
-        systemCore,
-        systemStyle,
-        knowledge,
-        userText: `Gib ausschließlich gültiges JSON gemäß Schema aus.\n\n${text}`,
-      });
+    } catch {
+      // One retry focused on valid JSON
+      r = await createStructuredTAKT(client, { systemCore, systemStyle, knowledge, userText: `Gib ausschließlich gültiges JSON gemäß Schema aus.\n\n${text}` });
       raw = extractOutputText(r);
       parsed = JSON.parse(raw);
     }
 
-    // 2) Enforce "Klare Kante" for coercion/threat cases (deterministic, like CustomGPT consistency)
-    parsed = enforceStep3ForClarity(parsed, text);
+    // 2) Deterministic Step-3 upgrades (CustomGPT-Nähe)
+    parsed = enforceStep3ForThreat(parsed, text);
+    parsed = enforceStep3ForExit(parsed, text);
 
     // 3) Render deterministically
     let rendered = renderTAKT(parsed);
 
-    // 4) Validate final text against hard rules, optionally repair
+    // 4) Validate + targeted repair (bis zu 2 Versuche)
     let errors = validateRenderedText(rendered);
     if (parsed?.step0?.decision !== "sofort_entfernen" && !rendered.includes("Kein sofortiger Löschbedarf: Weiter mit Schritt 1.")) {
       errors.push("Pflichtsatz fehlt: Kein sofortiger Löschbedarf: Weiter mit Schritt 1.");
     }
 
-    // Quality Gate: up to two targeted repair passes (keeps Frontend fast, but stabilizes Brand Voice).
     let attempts = 0;
     while (errors.length && attempts < 2) {
       attempts += 1;
-      const r2 = await repairIfNeeded(client, {
-        systemCore,
-        systemStyle,
-        knowledge,
-        userText: text,
-        previousJson: parsed,
-        validationErrors: errors,
-      });
+      const r2 = await repairIfNeeded(client, { systemCore, systemStyle, knowledge, previousJson: parsed, validationErrors: errors });
       const raw2 = extractOutputText(r2);
       const parsed2 = JSON.parse(raw2);
-      const rendered2 = renderTAKT(parsed2);
+
+      // Re-apply deterministic rules after repair (keeps tone stable)
+      let fixed = enforceStep3ForThreat(parsed2, text);
+      fixed = enforceStep3ForExit(fixed, text);
+
+      const rendered2 = renderTAKT(fixed);
       const errors2 = validateRenderedText(rendered2);
 
-      parsed = parsed2;
+      parsed = fixed;
       rendered = rendered2;
       errors = errors2;
     }
@@ -663,6 +728,8 @@ exports.handler = async (event) => {
       output: rendered,
       meta: {
         model: DEFAULT_MODEL,
+        rag_topk: RAG_TOPK,
+        tone: (TONE_PROFILE === "vorsichtig" ? "vorsichtig" : "klar"),
         warnings: errors.length ? errors : undefined,
       },
     });
