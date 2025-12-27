@@ -31,15 +31,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y pandoc
 
-      - name: Convert DOCX -> Markdown (robust)
+      - name: Convert DOCX -> TXT (robust)
         run: |
           set -euxo pipefail
 
           mkdir -p docs/converted
 
           # These two are strict (must exist with exact names)
-          pandoc "docs/source/regelwerk.docx" -t gfm -o "docs/converted/regelwerk.md"
-          pandoc "docs/source/brandvoice.docx" -t gfm -o "docs/converted/brandvoice.md"
+          pandoc "docs/source/regelwerk.docx" -t plain -o "docs/converted/regelwerk.txt"
+          pandoc "docs/source/brandvoice.docx" -t plain -o "docs/converted/brandvoice.txt"
 
           # This one is flexible (any matching filename)
           CM_FILE="$(ls -1 docs/source/CM-Eskalations-Konfliktanalyst*.docx 2>/dev/null | head -n 1 || true)"
@@ -51,7 +51,7 @@ jobs:
           fi
 
           echo "Using CM file: $CM_FILE"
-          pandoc "$CM_FILE" -t gfm -o "docs/converted/cm.md"
+          pandoc "$CM_FILE" -t plain -o "docs/converted/cm.txt"
 
           echo "Converted files:"
           ls -la docs/converted
@@ -61,8 +61,11 @@ jobs:
         run: |
           set -euxo pipefail
 
+          STORE_NAME="takt-ruleset-${GITHUB_SHA}"
+          echo "Using vector store name: $STORE_NAME"
+
           # The script must print a line like: VECTOR_STORE_ID=vs_...
-          node tools/openai_vectorstore_sync.mjs --in docs/converted --name "takt-ruleset-${GITHUB_SHA}" > ingest.out
+          node tools/openai_vectorstore_sync.mjs --in docs/converted --name "$STORE_NAME" > ingest.out
 
           echo "----- openai_vectorstore_sync output -----"
           cat ingest.out
