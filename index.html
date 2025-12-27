@@ -88,9 +88,7 @@
     function updateCounter() {
       const len = (input.value || "").length;
       counter.textContent = `${len} / ${MAX_CHARS} Zeichen`;
-      if (len > MAX_CHARS) {
-        counter.textContent += " (zu lang)";
-      }
+      if (len > MAX_CHARS) counter.textContent += " (zu lang)";
     }
 
     input.addEventListener("input", updateCounter);
@@ -139,7 +137,10 @@
           body: JSON.stringify({
             text,
             mode: "website",
-            options: { debug: true, force_rag: true }
+            options: {
+              public_variants: 2,
+              dm_variants: 0
+            }
           })
         });
 
