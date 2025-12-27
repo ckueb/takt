@@ -15,6 +15,14 @@ jobs:
   sync_and_deploy:
     runs-on: ubuntu-latest
 
+    # Secrets hier als ENV mappen (das ist erlaubt),
+    # aber NICHT in if:-Expressions verwenden.
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
+      NETLIFY_SITE_ID: ${{ secrets.NETLIFY_SITE_ID }}
+      NETLIFY_BUILD_HOOK_URL: ${{ secrets.NETLIFY_BUILD_HOOK_URL }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -43,60 +51,47 @@ jobs:
         run: |
           set -euxo pipefail
 
-          echo "Repo root:"
-          ls -la
-
           echo "docs/source:"
           ls -la docs/source || true
 
-          # Pflichtdateien müssen existieren (damit TAKT immer konsistent bleibt)
+          # Pflichtdateien müssen existieren
           test -f "docs/source/regelwerk.docx"
           test -f "docs/source/brandvoice.docx"
 
           mkdir -p docs/converted
 
-          # Flexibel: alle DOCX in docs/source werden konvertiert (Dateinamen dürfen variieren)
+          # Flexibel: alle DOCX konvertieren (Dateinamen dürfen variieren)
           shopt -s nullglob
           for f in docs/source/*.docx; do
             base="$(basename "$f" .docx)"
-
-            # Dateiname "safe" machen (spaces -> _, Sonderzeichen raus)
             safe="$(echo "$base" | tr ' ' '_' | tr -cd '[:alnum:]_-' )"
             out="docs/converted/${safe}.txt"
-
             echo "Converting: $f -> $out"
             pandoc "$f" -t plain -o "$out"
           done
 
           echo "docs/converted:"
           ls -la docs/converted
-
-          # Sicherstellen: es gibt mind. eine txt
           ls -1 docs/converted/*.txt >/dev/null
 
-          # Optional: harte Checkpoints für die beiden Kernfiles als erwartete Outputs
-          # (weil wir safe-Namen nutzen: regelwerk.txt / brandvoice.txt)
+          # erwartete Kernfiles (weil safe-Namen genutzt werden)
           test -f "docs/converted/regelwerk.txt"
           test -f "docs/converted/brandvoice.txt"
 
       - name: Create/Update OpenAI Vector Store + upload files
         id: ingest
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
           set -euxo pipefail
 
           STORE_NAME="takt-ruleset-${GITHUB_SHA}"
           echo "Using vector store name: $STORE_NAME"
 
-          # Dein Script nimmt --in und --name (wie in deinen Logs)
           node tools/openai_vectorstore_sync.mjs --in docs/converted --name "$STORE_NAME" > ingest.json
 
           echo "----- ingest.json -----"
           cat ingest.json
           echo "-----------------------"
 
-          # Script liefert JSON: { "vector_store_id": "vs_..." }
           VS_ID="$(node -e "const fs=require('fs'); const o=JSON.parse(fs.readFileSync('ingest.json','utf8')); process.stdout.write(o.vector_store_id || '');")"
           if [ -z "$VS_ID" ]; then
             echo "ERROR: vector_store_id missing in ingest.json"
@@ -107,30 +102,26 @@ jobs:
           echo "Vector store id: $VS_ID"
 
       - name: Set Netlify env var (TAKT_VECTOR_STORE_ID)
-        env:
-          NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
-          NETLIFY_SITE_ID: ${{ secrets.NETLIFY_SITE_ID }}
         run: |
           set -euxo pipefail
 
           npm i -g netlify-cli@latest
 
-          # Wichtig: Site linken, dann env:set ohne --site (fix für deinen Fehler)
+          # Link Site, dann env:set ohne --site (fix für "unknown option --site")
           netlify link --id "$NETLIFY_SITE_ID"
 
           echo "Setting TAKT_VECTOR_STORE_ID=${{ steps.ingest.outputs.vector_store_id }}"
           netlify env:set TAKT_VECTOR_STORE_ID "${{ steps.ingest.outputs.vector_store_id }}"
 
       - name: Trigger Netlify deploy (Build Hook) - optional but robust
-        if: ${{ secrets.NETLIFY_BUILD_HOOK_URL != '' }}
-        env:
-          NETLIFY_BUILD_HOOK_URL: ${{ secrets.NETLIFY_BUILD_HOOK_URL }}
         run: |
           set -euxo pipefail
-          curl -sS -X POST "$NETLIFY_BUILD_HOOK_URL" -o /dev/null
-          echo "Triggered Netlify build hook."
 
-      - name: No build hook configured (fallback)
-        if: ${{ secrets.NETLIFY_BUILD_HOOK_URL == '' }}
-        run: |
-          echo "NETLIFY_BUILD_HOOK_URL not set. Netlify may still deploy via GitHub integration, but the 'robust' guarantee is best with a build hook."
+          if [ -n "${NETLIFY_BUILD_HOOK_URL:-}" ]; then
+            echo "Triggering Netlify build hook..."
+            curl -sS -X POST "$NETLIFY_BUILD_HOOK_URL" -o /dev/null
+            echo "Triggered Netlify build hook."
+          else
+            echo "NETLIFY_BUILD_HOOK_URL not set. Skipping hook trigger."
+            echo "Hinweis: Für 'garantiert nach Env-Update deployen' ist der Build Hook die robusteste Variante."
+          fi
