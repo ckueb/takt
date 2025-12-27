@@ -169,7 +169,7 @@ exports.handler = async (event) => {
 
     const req = {
       model: DEFAULT_MODEL,
-      temperature: 0.2, // Weniger „generisches Support-Blabla“, stabilere Formulierungen
+      temperature: 0.3, // Weniger „generisches Support-Blabla“, stabilere Formulierungen
       input: [
         { role: "system", content: buildCoreSystem() },
         { role: "user", content: buildUserInstruction({ text, mode, publicVariants, dmVariants }) },
