@@ -1,6 +1,63 @@
-- name: Trigger Netlify deploy (Build Hook)
-  run: |
-    echo "Deploying with TAKT_VECTOR_STORE_ID=${{ steps.ingest.outputs.vector_store_id }}"
-    curl -s -X POST "$NETLIFY_BUILD_HOOK_URL"
-  env:
-    NETLIFY_BUILD_HOOK_URL: ${{ secrets.NETLIFY_BUILD_HOOK_URL }}
+name: TAKT: Sync Vector Store + Deploy (robust)
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch: {}
+
+jobs:
+  sync_and_deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install pandoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pandoc
+
+      - name: Convert DOCX -> Markdown
+        run: |
+          mkdir -p docs/converted
+          pandoc "docs/source/regelwerk.docx" -t gfm -o "docs/converted/regelwerk.md"
+          pandoc "docs/source/brandvoice.docx" -t gfm -o "docs/converted/brandvoice.md"
+          pandoc "docs/source/CM-Eskalations-Konfliktanalyst.docx" -t gfm -o "docs/converted/cm.md"
+          echo "Converted files:"
+          ls -la docs/converted
+
+      - name: Upload + create vector store (OpenAI)
+        id: ingest
+        run: |
+          node tools/openai_vectorstore_sync.mjs > ingest.out
+          cat ingest.out
+          VS_ID=$(grep "^VECTOR_STORE_ID=" ingest.out | cut -d= -f2 | tr -d '\r')
+          if [ -z "$VS_ID" ]; then
+            echo "ERROR: VECTOR_STORE_ID not found in output"
+            exit 1
+          fi
+          echo "vector_store_id=$VS_ID" >> $GITHUB_OUTPUT
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+      - name: Set Netlify env var (TAKT_VECTOR_STORE_ID)
+        run: |
+          npm i -g netlify-cli
+          echo "Setting TAKT_VECTOR_STORE_ID=${{ steps.ingest.outputs.vector_store_id }}"
+          netlify env:set TAKT_VECTOR_STORE_ID "${{ steps.ingest.outputs.vector_store_id }}" --site "$NETLIFY_SITE_ID"
+        env:
+          NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
+          NETLIFY_SITE_ID: ${{ secrets.NETLIFY_SITE_ID }}
+
+      - name: Trigger Netlify deploy (Build Hook)
+        run: |
+          echo "Deploying with TAKT_VECTOR_STORE_ID=${{ steps.ingest.outputs.vector_store_id }}"
+          curl -s -X POST "$NETLIFY_BUILD_HOOK_URL"
+        env:
+          NETLIFY_BUILD_HOOK_URL: ${{ secrets.NETLIFY_BUILD_HOOK_URL }}
