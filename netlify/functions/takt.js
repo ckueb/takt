@@ -169,7 +169,8 @@ const TAKT_SCHEMA = {
         rationale: { type: "string" },
         assumption: { type: "string" },
       },
-      required: ["risk", "decision", "violations", "rationale"],
+	      // Structured Outputs requires: required must include EVERY key in properties.
+	      required: ["risk", "decision", "violations", "rationale", "assumption"],
     },
     step1: {
       type: "object",
@@ -201,7 +202,8 @@ const TAKT_SCHEMA = {
         dm_reply: { type: "string" },
         action: { type: "string" },
       },
-      required: ["public_reply", "include_dm", "action"],
+	      // Structured Outputs requires: required must include EVERY key in properties.
+	      required: ["public_reply", "include_dm", "dm_reply", "action"],
     },
   },
   required: ["language", "step0", "step1", "step2", "step3"],
@@ -347,7 +349,15 @@ async function createStructuredTAKT(client, { systemCore, systemStyle, knowledge
       {
         role: "user",
         content:
-          `Analysiere den folgenden Kommentar strikt nach TAKT und gib das Ergebnis ausschließlich im JSON Schema aus.\n\nKommentar:\n${userText}`,
+	          `Analysiere den folgenden Kommentar strikt nach TAKT und gib das Ergebnis ausschließlich im JSON Schema aus.
+
+Wichtig für das Schema:
+- Fülle ALLE Felder.
+- Wenn du keine Annahme brauchst, setze step0.assumption auf einen leeren String.
+- Wenn include_dm = false, setze step3.dm_reply auf einen leeren String.
+
+Kommentar:
+${userText}`,
       },
     ],
     text: {
@@ -375,7 +385,7 @@ async function repairIfNeeded(client, { systemCore, systemStyle, knowledge, user
       {
         role: "user",
         content:
-          `Dein vorheriger Output verletzt Format- oder Stilregeln.\n\nFehlerliste:\n- ${validationErrors.join("\n- ")}\n\nKorrigiere ausschließlich Form und Stil. Inhaltliche Aussagen nur wenn zwingend nötig, damit die Regeln erfüllt sind.\nGib wieder ausschließlich JSON im selben Schema aus.\n\nVorheriges JSON:\n${JSON.stringify(previousJson)}`,
+	          `Dein vorheriger Output verletzt Format- oder Stilregeln.\n\nFehlerliste:\n- ${validationErrors.join("\n- ")}\n\nKorrigiere ausschließlich Form und Stil. Inhaltliche Aussagen nur wenn zwingend nötig, damit die Regeln erfüllt sind.\nGib wieder ausschließlich JSON im selben Schema aus.\n\nSchema-Hinweise:\n- Fülle ALLE Felder.\n- Wenn du keine Annahme brauchst, setze step0.assumption auf einen leeren String.\n- Wenn include_dm = false, setze step3.dm_reply auf einen leeren String.\n\nVorheriges JSON:\n${JSON.stringify(previousJson)}`,
       },
     ],
     text: {
