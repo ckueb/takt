@@ -2,7 +2,13 @@ name: "TAKT: Sync Vector Store + Deploy (robust)"
 
 on:
   push:
-    branches: ["main"]
+    branches: [ "main" ]
+    paths:
+      - "docs/source/**"
+      - "tools/**"
+      - ".github/workflows/takt-sync-vector-store.yml"
+      - "package.json"
+      - "package-lock.json"
   workflow_dispatch:
 
 jobs:
@@ -18,54 +24,62 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install Python deps (python-docx)
+      - name: Install Node dependencies (ci if lock exists)
         run: |
           set -euxo pipefail
-          python -m pip install --upgrade pip
-          pip install python-docx
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
 
-      - name: Install dependencies
+      - name: Install pandoc
         run: |
           set -euxo pipefail
-          npm ci || npm install
+          sudo apt-get update
+          sudo apt-get install -y pandoc
 
-      - name: Convert DOCX -> TXT (robust)
+      - name: Convert DOCX -> TXT (robust + flexible)
         run: |
           set -euxo pipefail
+
+          echo "Repo root:"
+          ls -la
+
+          echo "docs/source:"
+          ls -la docs/source || true
+
+          # Pflichtdateien müssen existieren (damit TAKT immer konsistent bleibt)
+          test -f "docs/source/regelwerk.docx"
+          test -f "docs/source/brandvoice.docx"
 
           mkdir -p docs/converted
 
-          echo "Files in docs/source:"
-          ls -la docs/source
+          # Flexibel: alle DOCX in docs/source werden konvertiert (Dateinamen dürfen variieren)
+          shopt -s nullglob
+          for f in docs/source/*.docx; do
+            base="$(basename "$f" .docx)"
 
-          # Convert ALL .docx in docs/source into .txt in docs/converted
-          python tools/docx_to_text.py docs/source docs/converted
+            # Dateiname "safe" machen (spaces -> _, Sonderzeichen raus)
+            safe="$(echo "$base" | tr ' ' '_' | tr -cd '[:alnum:]_-' )"
+            out="docs/converted/${safe}.txt"
 
-          echo "Files in docs/converted:"
+            echo "Converting: $f -> $out"
+            pandoc "$f" -t plain -o "$out"
+          done
+
+          echo "docs/converted:"
           ls -la docs/converted
 
-          # Ensure strict required outputs exist (basename -> .txt)
-          test -f docs/converted/regelwerk.txt
-          test -f docs/converted/brandvoice.txt
+          # Sicherstellen: es gibt mind. eine txt
+          ls -1 docs/converted/*.txt >/dev/null
 
-          # Create a stable alias for the CM file (whatever exact filename is)
-          CM_TXT="$(ls -1 docs/converted/CM-Eskalations-Konfliktanalyst*.txt 2>/dev/null | head -n 1 || true)"
-          if [ -z "$CM_TXT" ]; then
-            echo "ERROR: Could not find CM-Eskalations-Konfliktanalyst*.txt in docs/converted"
-            echo "Converted files:"
-            ls -la docs/converted
-            exit 1
-          fi
+          # Optional: harte Checkpoints für die beiden Kernfiles als erwartete Outputs
+          # (weil wir safe-Namen nutzen: regelwerk.txt / brandvoice.txt)
+          test -f "docs/converted/regelwerk.txt"
+          test -f "docs/converted/brandvoice.txt"
 
-          cp "$CM_TXT" docs/converted/cm.txt
-          echo "Using CM file: $CM_TXT -> docs/converted/cm.txt"
-
-      - name: Create Vector Store + upload files (OpenAI)
+      - name: Create/Update OpenAI Vector Store + upload files
         id: ingest
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -73,31 +87,24 @@ jobs:
           set -euxo pipefail
 
           STORE_NAME="takt-ruleset-${GITHUB_SHA}"
-          echo "Using vector store name: ${STORE_NAME}"
+          echo "Using vector store name: $STORE_NAME"
 
-          # Script outputs JSON -> capture it
-          node tools/openai_vectorstore_sync.mjs --in docs/converted --name "${STORE_NAME}" > ingest.out
+          # Dein Script nimmt --in und --name (wie in deinen Logs)
+          node tools/openai_vectorstore_sync.mjs --in docs/converted --name "$STORE_NAME" > ingest.json
 
-          echo "----- openai_vectorstore_sync output -----"
-          cat ingest.out
-          echo "------------------------------------------"
+          echo "----- ingest.json -----"
+          cat ingest.json
+          echo "-----------------------"
 
-          # Robust parsing:
-          # 1) Try JSON key vector_store_id
-          # 2) Fallback to grep line VECTOR_STORE_ID=...
-          VS_ID="$(node -e "const fs=require('fs'); const t=fs.readFileSync('ingest.out','utf8'); try { const j=JSON.parse(t); process.stdout.write((j.vector_store_id||'').trim()); } catch(e) { process.stdout.write(''); }")"
-
+          # Script liefert JSON: { "vector_store_id": "vs_..." }
+          VS_ID="$(node -e "const fs=require('fs'); const o=JSON.parse(fs.readFileSync('ingest.json','utf8')); process.stdout.write(o.vector_store_id || '');")"
           if [ -z "$VS_ID" ]; then
-            VS_ID="$(grep -E '^VECTOR_STORE_ID=' ingest.out | head -n 1 | cut -d= -f2 | tr -d '\r' || true)"
-          fi
-
-          if [ -z "$VS_ID" ]; then
-            echo "ERROR: vector_store_id not found in ingest output."
+            echo "ERROR: vector_store_id missing in ingest.json"
             exit 1
           fi
 
           echo "vector_store_id=$VS_ID" >> "$GITHUB_OUTPUT"
-          echo "Vector Store created: $VS_ID"
+          echo "Vector store id: $VS_ID"
 
       - name: Set Netlify env var (TAKT_VECTOR_STORE_ID)
         env:
@@ -106,21 +113,24 @@ jobs:
         run: |
           set -euxo pipefail
 
-          npm i -g netlify-cli
-          echo "Setting TAKT_VECTOR_STORE_ID=${{ steps.ingest.outputs.vector_store_id }}"
+          npm i -g netlify-cli@latest
 
-          netlify env:set TAKT_VECTOR_STORE_ID "${{ steps.ingest.outputs.vector_store_id }}" --site "$NETLIFY_SITE_ID"
+          # Wichtig: Site linken, dann env:set ohne --site (fix für deinen Fehler)
+          netlify link --id "$NETLIFY_SITE_ID"
+
+          echo "Setting TAKT_VECTOR_STORE_ID=${{ steps.ingest.outputs.vector_store_id }}"
+          netlify env:set TAKT_VECTOR_STORE_ID "${{ steps.ingest.outputs.vector_store_id }}"
 
       - name: Trigger Netlify deploy (Build Hook) - optional but robust
+        if: ${{ secrets.NETLIFY_BUILD_HOOK_URL != '' }}
         env:
           NETLIFY_BUILD_HOOK_URL: ${{ secrets.NETLIFY_BUILD_HOOK_URL }}
         run: |
           set -euxo pipefail
+          curl -sS -X POST "$NETLIFY_BUILD_HOOK_URL" -o /dev/null
+          echo "Triggered Netlify build hook."
 
-          if [ -z "${NETLIFY_BUILD_HOOK_URL:-}" ]; then
-            echo "No NETLIFY_BUILD_HOOK_URL set -> skipping deploy hook."
-            exit 0
-          fi
-
-          echo "Deploying with TAKT_VECTOR_STORE_ID=${{ steps.ingest.outputs.vector_store_id }}"
-          curl -s -X POST "$NETLIFY_BUILD_HOOK_URL"
+      - name: No build hook configured (fallback)
+        if: ${{ secrets.NETLIFY_BUILD_HOOK_URL == '' }}
+        run: |
+          echo "NETLIFY_BUILD_HOOK_URL not set. Netlify may still deploy via GitHub integration, but the 'robust' guarantee is best with a build hook."
