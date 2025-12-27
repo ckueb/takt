@@ -1,0 +1,6 @@
+- name: Trigger Netlify deploy (Build Hook)
+  run: |
+    echo "Deploying with TAKT_VECTOR_STORE_ID=${{ steps.ingest.outputs.vector_store_id }}"
+    curl -s -X POST "$NETLIFY_BUILD_HOOK_URL"
+  env:
+    NETLIFY_BUILD_HOOK_URL: ${{ secrets.NETLIFY_BUILD_HOOK_URL }}
