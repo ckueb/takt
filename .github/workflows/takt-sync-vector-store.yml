@@ -19,6 +19,11 @@ jobs:
         with:
           node-version: "20"
 
+      - name: Install dependencies
+        run: |
+          set -euxo pipefail
+          npm install
+
       - name: Install pandoc
         run: |
           set -euxo pipefail
