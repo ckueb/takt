@@ -62,7 +62,7 @@ jobs:
           set -euxo pipefail
 
           # The script must print a line like: VECTOR_STORE_ID=vs_...
-          node tools/openai_vectorstore_sync.mjs > ingest.out
+          node tools/openai_vectorstore_sync.mjs --in docs/converted --name "takt-ruleset-${GITHUB_SHA}" > ingest.out
 
           echo "----- openai_vectorstore_sync output -----"
           cat ingest.out
