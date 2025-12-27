@@ -16,6 +16,10 @@ const DEFAULT_MAX_CHARS = 2000;
 const MAX_CHARS = Number(process.env.TAKT_MAX_CHARS || DEFAULT_MAX_CHARS);
 const RAG_TOPK = Math.max(0, Number(process.env.TAKT_RAG_TOPK || 6));
 
+// Tone profile for Step 3 language. Defaults to "klar".
+// Allowed values: "klar" | "vorsichtig" (anything else falls back to "klar").
+const TONE_PROFILE = String(process.env.TAKT_TONE || "klar").toLowerCase();
+
 // Structured Outputs requires models that support json_schema formatting.
 // We default to gpt-4o-mini for reliability.
 const DEFAULT_MODEL = process.env.TAKT_MODEL || "gpt-4o-mini";
