@@ -15,8 +15,8 @@
  *     }
  *   }
  *
- * Uses OpenAI Vector Stores + file_search for Regelwerk/Brandvoice (and optionally CM instructions).
- * Weekly updates via GitHub Actions updating TAKT_VECTOR_STORE_ID on Netlify.
+ * Uses OpenAI Vector Stores + file_search for Regelwerk/Brandvoice.
+ * GitHub Actions updates TAKT_VECTOR_STORE_ID on Netlify.
  *
  * IMPORTANT:
  * - file_search is ALWAYS enforced via tool_choice.
@@ -52,14 +52,14 @@ function clampInt(n, min, max, fallback) {
 }
 
 /**
- * Hard contract prompt: forces style + structure.
- * Details live in the vector store and are pulled via file_search.
+ * Hard, short "contract" prompt.
+ * Long details stay in the vector store and are retrieved via file_search.
  */
 function buildCoreSystem() {
   return [
     "Du bist TAKT, ein Online-Moderations- und Deeskalationsassistent.",
-    "Du arbeitest praxisnah, respektvoll, klar und moderationsstark (keine Therapie-/Pädagogik-Sprache).",
-    "Du folgst verbindlich dem TAKT-Regelwerk (Schritt 0–3). Schritt 3 setzt Brand Voice strikt um.",
+    "Du arbeitest praxisnah, deeskalierend, respektvoll und lösungsorientiert.",
+    "Du folgst verbindlich dem TAKT-Regelwerk (Schritt 0–3) und setzt die Brand Voice in Schritt 3 strikt um.",
     "Bei Konflikt gilt: Regelwerk hat Vorrang vor Brand Voice.",
     "",
     "Ausgabeformat MUSS exakt diese vier Abschnitte enthalten (Überschriften exakt wie hier):",
@@ -68,23 +68,35 @@ function buildCoreSystem() {
     "2. Kompass (SIDE Modell – Community-Dynamik)",
     "3. Tonart (GFK – Antwortvorschlag)",
     "",
-    "Toolpflicht: Nutze IMMER file_search (Regelwerk/Brandvoice/Instructions), bevor du Schritt 3 formulierst.",
+    "WICHTIGER ARBEITSAUFTRAG (verbindlich):",
+    "Du MUSST vor jeder Antwort das Tool file_search nutzen und dabei BEIDE Dokumente berücksichtigen:",
+    "- Dokument 1: regelwerk (TAKT-Regelwerk Schritt 0–3)",
+    "- Dokument 2: brandvoice (Ton & Stilregeln für Schritt 3)",
     "",
-    "Stilregeln (hart):",
-    "- Natürlich, kurz, aktiv. Keine Emojis. Keine Gedankenstriche.",
-    "- Keine Meta-Erklärungen über dein Vorgehen. Kein Abschluss wie „Diese Antworten…“. Keine Quellen/Verweise/Dateinamen/Zitate im Output.",
-    "- Keine Weichmacher/Coach-Sprache: NICHT „es hört sich an“, „klingt“, „wenn du magst“, „teile gern“, „wir hören“, „wir wünschen uns“, „wir freuen uns“.",
-    "- Keine Behörden-/Prozesswörter: NICHT „prüfen Maßnahmen“, „es wird geprüft“, „Befund“, „Vorgang“, „Drohanzeige“.",
+    "Vorgehen (immer gleich):",
+    "1) Suche gezielt nach 'Türsteher', 'Analyse', 'Kompass', 'Tonart' im Regelwerk und lade passende Passagen.",
+    "2) Suche gezielt nach 'Ton', 'Stil', 'Do/Don't', 'Formulierungen', 'Blacklist/Whitelist' in der Brand Voice und lade passende Passagen.",
+    "3) Formuliere die Antwort NUR auf Basis der geladenen Passagen.",
+    "4) Wenn du keine passenden Passagen findest: STOPP und gib aus: 'Regelwerk/Brand Voice konnte nicht geladen werden – bitte Sync prüfen.'",
     "",
-    "Schritt 3 (Tonart) – Formvorgabe:",
-    "- Liefere genau die verlangte Anzahl Varianten.",
-    "- Jede Variante maximal 2 Sätze.",
-    "- Satz 1: klare Einordnung / Grenze.",
-    "- Satz 2: konkrete Handlungsaufforderung ODER klare Konsequenz (wenn Regelverstoß).",
-    "- Bei pauschaler Negativkritik (z. B. „alles mist“): freundlich, aber klar: so pauschal hilft es nicht; bitte konkretisieren.",
-    "Pflicht: In Schritt 0 MUSS eine kurze Risiko-Einschätzung stehen (niedrig/mittel/hoch) mit 1 Satz Begründung.",
-    "Pflicht: Übernimm Anrede und Sprachregister des Kommentars (Du/Sie, locker/formell), bleib dabei aber respektvoll und moderationsklar.",
-    "Pflicht: Am Ende MUSS eine klare Moderationsmaßnahme stehen (z. B. stehen_lassen, antworten, ausblenden/entfernen, verwarnen, sperren) – konkret und aktiv formuliert.",
+    "Regelpriorität: Regelwerk > Brand Voice.",
+    "",
+    "Schritt 3 (GFK) muss IMMER so klingen:",
+    "- Erst 1 kurzer Satz: Emotion/Frust anerkennen, ohne zu loben (z. B. „Klingt frustrierend.“).",
+    "- Dann 1 konkrete Rückfrage: „Was genau…?“ / „Woran machst du das fest…?“",
+    "- Optional 1 Normsatz, aber weich formuliert: „Mit konkreten Punkten können wir besser reagieren.“",
+    "- KEIN Tadel, KEINE Belehrung, KEIN Shaming. Vermeide Formulierungen wie „bringt uns nicht weiter“, „so pauschal“, „wirkt abwertend“.",
+    "- Keine Imperative wie „Formuliere…“ oder „Bitte konkretisiere…“ – lieber als Einladung/Option formulieren.",
+    "- Maximal 2 Sätze pro Variante.",
+    "",
+    "Blacklist: keine Floskeln (z. B. „Danke für deinen Beitrag“, „Wir hören…“, „Wir wünschen uns…“, „Wir freuen uns…“).",
+    "Blacklist: keine Behörden-/Prozesssprache (z. B. „prüfen Maßnahmen“, „es wird geprüft“, „Befund“, „Vorgang“, „Drohanzeige“).",
+    "Wenn ein Regelverstoß vorliegt: klare Grenze setzen und Konsequenz in natürlicher Sprache nennen (aktiv, nicht vage).",
+    "",
+    "Keine Meta-Erklärungen über dein Vorgehen.",
+    "Keine Quellen, keine Verweise, keine Klammer-Zitate im Output.",
+    "Keine Emojis.",
+    "Keine Gedankenstriche.",
   ].join("\n");
 }
 
@@ -94,10 +106,14 @@ function buildUserInstruction({ text, mode, publicVariants, dmVariants }) {
     "Wichtig:",
     `- Modus: ${mode || "website"}`,
     `- Erzeuge ${publicVariants} öffentliche Moderatorenantwort(en) als Varianten.`,
-    `- Erzeuge ${dmVariants} Direktnachricht(en) als Varianten (wenn 0, lasse DM weg).`,
-    "- Schritt 3: keine Weichmacher/Coach-Sprache. Keine Floskeln. Max 2 Sätze pro Variante.",
-    "- Wenn Regelverstoß: klare Grenze + klare Konsequenz (aktiv).",
-    "- Wenn kein Regelverstoß, aber pauschal/abwertend: freundlich, aber klar zur Konkretisierung auffordern.",
+    `- Erzeuge ${dmVariants} Direktnachricht(en) an das Mitglied als Varianten (wenn 0, lasse den DM-Block weg).`,
+    "- Verbindlich: Nutze Regelwerk UND Brand Voice aus file_search als Grundlage.",
+    "- Wenn Regelwerk/Brand Voice nicht geladen werden kann: brich ab und melde das (kein Raten).",
+    "- Schritt 3: pro Variante maximal 2 Sätze (kurz).",
+    "- Schritt 3: zuerst Frust anerkennen (1 Satz), dann eine konkrete Frage stellen (1 Satz).",
+    "- Keine erzieherischen Formulierungen, keine Abwertung, keine Belehrung.",
+    "- Halte Schritt 3 handlungsorientiert und klar. Wenn ein Regelverstoß vorliegt, setze eine klare Grenze und nenne die Konsequenz in natürlicher Sprache.",
+    "- Vermeide Floskeln wie „Danke für deinen Beitrag“.",
     "",
     "Kommentar:",
     text,
@@ -110,8 +126,12 @@ async function getOpenAIClient() {
   return new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 }
 
+/**
+ * Extract file_search results from a Responses API response.
+ * We keep this defensive because shapes can vary slightly by SDK/version.
+ */
 function extractFileSearchResults(response) {
-  const out = Array.isArray(response.output) ? response.output : [];
+  const out = Array.isArray(response?.output) ? response.output : [];
   const calls = out.filter((x) => x && x.type === "file_search_call");
 
   const results = [];
@@ -149,7 +169,7 @@ exports.handler = async (event) => {
 
     const req = {
       model: DEFAULT_MODEL,
-      temperature: 0.2, // Änderung C: weniger „generisches Support-Blabla“, stabilere Formulierungen
+      temperature: 0.2, // Weniger „generisches Support-Blabla“, stabilere Formulierungen
       input: [
         { role: "system", content: buildCoreSystem() },
         { role: "user", content: buildUserInstruction({ text, mode, publicVariants, dmVariants }) },
@@ -161,10 +181,14 @@ exports.handler = async (event) => {
           max_num_results: RAG_TOPK,
         },
       ],
-      tool_choice: { type: "file_search" }, // file_search immer erzwingen
+
+      // ALWAYS enforce retrieval
+      tool_choice: { type: "file_search" },
+
       max_output_tokens: 900,
     };
 
+    // Debug: include tool results in response object
     if (debug) {
       req.include = ["file_search_call.results"];
     }
@@ -177,13 +201,17 @@ exports.handler = async (event) => {
     }
 
     const fsResults = extractFileSearchResults(response)
-      .slice(0, 8)
+      .slice(0, 12)
       .map((r) => ({
         score: r.score,
         file_id: r.file_id || r.file?.id,
         filename: r.filename || r.file?.filename,
-        text_preview: (r.text || r.content || "").toString().slice(0, 500),
+        text_preview: (r.text || r.content || "").toString().slice(0, 600),
       }));
+
+    const touchedFiles = Array.from(
+      new Set(fsResults.map((r) => (r.filename || "").toLowerCase()).filter(Boolean))
+    );
 
     return json(200, {
       output,
@@ -192,6 +220,9 @@ exports.handler = async (event) => {
         rag_topk: RAG_TOPK,
         tool_choice: "force:file_search",
         file_search_results_count: fsResults.length,
+        touched_files: touchedFiles,
+        has_regelwerk: touchedFiles.some((x) => x.includes("regelwerk")),
+        has_brandvoice: touchedFiles.some((x) => x.includes("brandvoice")),
         file_search_results: fsResults,
       },
     });
