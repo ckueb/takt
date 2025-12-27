@@ -136,7 +136,11 @@
         const res = await fetch("/.netlify/functions/takt", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ text })
+          body: JSON.stringify({
+            text,
+            mode: "website",
+            options: { debug: true, force_rag: true }
+          })
         });
 
         const data = await res.json().catch(() => ({}));
