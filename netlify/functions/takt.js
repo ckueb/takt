@@ -353,6 +353,8 @@ async function createStructuredTAKT(client, { systemCore, systemStyle, knowledge
     text: {
       format: {
         type: "json_schema",
+			// Required by the Responses API for structured outputs
+			name: "takt_output",
         strict: true,
         schema: TAKT_SCHEMA,
       },
@@ -379,6 +381,8 @@ async function repairIfNeeded(client, { systemCore, systemStyle, knowledge, user
     text: {
       format: {
         type: "json_schema",
+			// Required by the Responses API for structured outputs
+			name: "takt_output",
         strict: true,
         schema: TAKT_SCHEMA,
       },
